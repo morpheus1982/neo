@@ -1,0 +1,20 @@
+{
+  "name": "neo-extension",
+  "version": "1.0.0",
+  "description": "Neo - 智能 API 监听与分析平台 - 浏览器插件",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.11",
+    "@crxjs/vite-plugin": "^2.0.0-beta.24"
+  },
+  "dependencies": {}
+}
+
