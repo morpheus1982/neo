@@ -6,6 +6,9 @@ export interface ApiCall {
   inputMapping?: Record<string, string>;  // 参数映射规则
   outputMapping?: Record<string, string>; // 输出映射规则
   condition?: string;                      // 执行条件（可选）
+  loopType?: 'for' | 'while' | 'forEach'; // 循环类型（用于迭代式编排）
+  loopCondition?: string;                 // 循环条件表达式
+  maxIterations?: number;                  // 最大迭代次数（防止无限循环）
 }
 
 export interface SkillDefinition {

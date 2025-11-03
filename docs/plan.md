@@ -4,6 +4,20 @@
 
 所有 Phase 1-5 的核心功能均已实现完成。
 
+## 最新优化（2025-01-XX）
+
+### 🚀 AI 学习能力增强
+- ✅ 优化 API 文档生成 Prompt，让 AI 深入学习 API 的业务语义和使用模式
+- ✅ 支持识别 API 的常见使用模式、最佳实践和常见错误
+- ✅ 增强 API 关系学习，理解 API 之间的依赖关系和调用顺序
+
+### 🎯 智能技能编排增强
+- ✅ 优化技能编排 Prompt，支持迭代式编排（如不断迭代搜索、推荐）
+- ✅ 支持循环、迭代、条件判断等复杂流程
+- ✅ 增强功能生成：将简单的 API 调用组合成高级业务功能
+- ✅ 更新类型定义，支持循环类型（loopType）、循环条件（loopCondition）等字段
+- ✅ 提高 AI 温度参数和 token 限制，支持更创新的编排方式
+
 ---
 
 ## 已完成功能
@@ -32,16 +46,17 @@
 
 ---
 
-### Phase 2: AI 文档生成 ✅ 100%
+### Phase 2: AI 文档生成（增强版：AI 学习 API）✅ 100%
 
 #### 2.1 AI 服务集成 ✅
 - [x] 创建 SiliconFlow API 客户端（DeepSeek-V3.2-Exp）
-- [x] 设计 API 文档生成 Prompt
+- [x] 设计 API 文档生成 Prompt（增强版：深入学习 API）
 - [x] 实现错误处理和重试机制
 
 #### 2.2 文档生成服务 ✅
 - [x] 创建 `api-analysis.service.ts`
 - [x] 批量处理未分析的 API 调用
+- [x] **优化 Prompt**：增强业务语义理解、使用模式识别、API 关系学习
 
 #### 2.3 文档查询接口 ✅
 - [x] `GET /api/docs` - 查询 API 文档列表
@@ -51,16 +66,19 @@
 
 ---
 
-### Phase 3: 技能自动编排 ✅ 100%
+### Phase 3: 技能自动编排（增强版：智能编排）✅ 100%
 
 #### 3.1 技能编排服务 ✅
 - [x] 创建 `Skill` 数据模型（Prisma）
 - [x] 创建 `skill-orchestration.service.ts`
 - [x] AI 分析相关 API，识别工作流模式
+- [x] **优化 Prompt**：支持迭代式编排、上下文感知、增强功能生成
+- [x] **增强类型定义**：添加循环类型（loopType）、循环条件（loopCondition）等字段
 
 #### 3.2 JavaScript 代码生成器 ✅
 - [x] 创建 `skill-code-generator.ts`
 - [x] 根据技能定义生成 JavaScript 代码
+- [x] **支持复杂控制流**：循环、迭代、条件判断
 
 #### 3.3 技能管理接口 ✅
 - [x] `POST /api/skills` - 创建技能
