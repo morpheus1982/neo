@@ -132,25 +132,26 @@
 
 ### 🔴 必须修复（阻塞功能）
 
-#### 1. 插件图标文件缺失 ⚠️
-- [ ] 创建插件图标文件：
+#### 1. 插件图标文件创建 ✅
+- [x] 创建插件图标文件：
   - `neo-extension/src/icons/icon16.png`
   - `neo-extension/src/icons/icon48.png`
   - `neo-extension/src/icons/icon128.png`
-- **影响**: 插件无法正确加载
+- **状态**: 已完成
+- **方法**: 从 `neo.png` (1024x1024) 源文件生成
 
-#### 2. 技能代码生成器中的 URL 替换 ⚠️
-- [ ] 修复 `skill-code-generator.ts` 中的 TODO：
+#### 2. 技能代码生成器中的 URL 替换 ✅
+- [x] 修复 `skill-code-generator.ts` 中的 TODO：
   - 当前：`url: '${apiCall.apiDocId}'` （使用 ID 而不是实际 URL）
-  - 需要：从 ApiDoc 中获取实际的 URL
-- **位置**: `neo-backend/src/services/skill-code-generator.ts:36`
-- **影响**: 生成的技能代码无法正确执行 API 调用
+  - 已修复：从 ApiDoc 中获取实际的 URL
+- **位置**: `neo-backend/src/services/skill-code-generator.ts`
+- **影响**: 生成的技能代码现在可以正确执行 API 调用
 
-#### 3. API 调用方法硬编码问题 ⚠️
-- [ ] 修复 `skill-code-generator.ts` 中硬编码的 `method: 'GET'`
-- [ ] 应该从 ApiDoc 中获取实际的 HTTP 方法
-- **位置**: `neo-backend/src/services/skill-code-generator.ts:37`
-- **影响**: 生成的技能代码可能使用错误的 HTTP 方法
+#### 3. API 调用方法硬编码问题 ✅
+- [x] 修复 `skill-code-generator.ts` 中硬编码的 `method: 'GET'`
+- [x] 现在从 ApiDoc 中获取实际的 HTTP 方法
+- **位置**: `neo-backend/src/services/skill-code-generator.ts`
+- **影响**: 生成的技能代码现在使用正确的 HTTP 方法
 
 ---
 
@@ -277,29 +278,94 @@
 - **后端**：TypeScript + Node.js + Express
 - **数据库**：PostgreSQL + Prisma ORM
 - **AI**：SiliconFlow API (DeepSeek-V3.2-Exp)
+- **基础设施**：Docker + Docker Compose（用于快速启动数据库）
+
+---
+
+## MVP 快速启动指南
+
+### 🚀 一键启动（推荐）
+
+**Windows**:
+```bash
+scripts\start-mvp.bat
+```
+
+**Linux/Mac**:
+```bash
+chmod +x scripts/start-mvp.sh
+./scripts/start-mvp.sh
+```
+
+### 手动启动步骤
+
+1. **启动数据库**（使用 Docker）:
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **启动后端**:
+   ```bash
+   cd neo-backend
+   npm install
+   cp .env.example .env
+   npm run prisma:generate
+   npm run prisma:migrate
+   npm run dev
+   ```
+
+3. **构建插件**:
+   ```bash
+   cd neo-extension
+   npm install
+   npm run build
+   ```
+
+4. **加载插件到 Chrome**:
+   - 打开 `chrome://extensions/`
+   - 开启"开发者模式"
+   - 加载 `neo-extension/dist` 目录
+
+### MVP 测试示例
+
+```bash
+# 测试健康检查
+curl http://localhost:3000/health
+
+# 测试 API 文档列表
+curl http://localhost:3000/api/docs
+
+# 测试技能列表
+curl http://localhost:3000/api/skills
+
+# 触发 API 分析
+curl -X POST http://localhost:3000/api/docs/analyze-pending \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 3}'
+```
+
+详细启动说明请查看 [启动指南](./mvp-start.md)。
 
 ---
 
 ## 优先级总结
 
 ### 🔴 立即修复（阻塞功能）
-1. 插件图标文件缺失
-2. 技能代码生成器中的 URL 替换
-3. API 调用方法硬编码问题
+（当前无阻塞问题）
 
 ### 🟡 重要完善（影响体验）
-4. Redis/队列系统实现
-5. 定时任务机制
-6. 技能执行错误重试机制
-7. 技能更新推送机制
+2. Redis/队列系统实现
+3. 定时任务机制
+4. 技能执行错误重试机制
+5. 技能更新推送机制
 
 ### 🟢 后续优化（提升质量）
-8. 单元测试和集成测试
-9. 监控和告警
-10. 文档完善
+6. 单元测试和集成测试
+7. 监控和告警
+8. 文档完善
 
 ---
 
-**最后更新**: 2025-11-03  
+**最后更新**: 2025-01-XX  
 **项目状态**: 核心功能已实现 ✅，待修复阻塞问题
 
