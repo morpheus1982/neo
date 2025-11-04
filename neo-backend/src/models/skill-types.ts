@@ -36,6 +36,8 @@ export interface ExecutionStep {
   responseData?: any;
   error?: string;
   duration: number;
+  retryCount?: number; // 重试次数
+  retryAttempts?: Array<{ attempt: number; error: string; duration: number }>; // 重试记录
 }
 
 export interface ExecutionLog {
