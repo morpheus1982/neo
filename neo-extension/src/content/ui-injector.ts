@@ -110,9 +110,12 @@ async function executeSkillInPage(skillId: string): Promise<void> {
       (step) => {
         const progressDiv = document.getElementById('neo-skill-progress');
         if (progressDiv) {
+          const retryInfo = step.retryCount && step.retryCount > 0 
+            ? ` <span style="color: orange;">(重试 ${step.retryCount} 次)</span>` 
+            : '';
           progressDiv.innerHTML += `
             <div style="margin-top: 8px;">
-              <strong>步骤 ${step.order + 1}:</strong> ${step.status === 'success' ? '✓' : '✗'} ${step.apiCallId}
+              <strong>步骤 ${step.order + 1}:</strong> ${step.status === 'success' ? '✓' : '✗'} ${step.apiCallId}${retryInfo}
             </div>
           `;
         }
@@ -134,11 +137,22 @@ async function executeSkillInPage(skillId: string): Promise<void> {
         ${result.steps ? `
           <div style="margin-top: 12px;">
             <strong>执行步骤:</strong>
-            ${result.steps.map(s => `
+            ${result.steps.map(s => {
+              const retryInfo = s.retryCount && s.retryCount > 0 
+                ? ` <span style="color: orange;">(重试 ${s.retryCount} 次)</span>` 
+                : '';
+              const retryDetails = s.retryAttempts && s.retryAttempts.length > 0
+                ? `<div style="margin-left: 20px; font-size: 12px; color: #666;">
+                    ${s.retryAttempts.map(ra => `  重试 ${ra.attempt}: ${ra.error} (${ra.duration}ms)`).join('<br>')}
+                  </div>`
+                : '';
+              return `
               <div style="margin-top: 4px;">
-                ${s.status === 'success' ? '✓' : '✗'} ${s.apiCallId} (${s.duration}ms)
+                ${s.status === 'success' ? '✓' : '✗'} ${s.apiCallId} (${s.duration}ms)${retryInfo}
+                ${retryDetails}
               </div>
-            `).join('')}
+            `;
+            }).join('')}
           </div>
         ` : ''}
         <button onclick="this.parentElement.parentElement.remove()" style="margin-top: 16px; padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">
