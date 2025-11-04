@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import { PrismaClient } from '@prisma/client';
 import type { ApiCall } from '../models/skill-types';
-import { generateSkillCode, createSkillDefinition } from '../services/skill-code-generator';
+import { generateSkillCode, createSkillDefinition, type ApiDocInfo } from '../services/skill-code-generator';
 
 // SiliconFlow API 配置
 const openai = new OpenAI({
@@ -109,15 +109,49 @@ export async function optimizeSkill(skillId: string): Promise<void> {
 
   const optimizedData = JSON.parse(jsonMatch[0]);
   
+  // 获取优化后的 API 序列
+  const optimizedApiSequence = optimizedData.apiSequence || definition.apiSequence;
+  
+  // 查询所有相关的 ApiDoc 信息
+  const apiDocIds = optimizedApiSequence.map((api: ApiCall) => api.apiDocId);
+  const apiDocs = await prisma.apiDoc.findMany({
+    where: {
+      id: { in: apiDocIds },
+      domain: skill.domain,
+    },
+    select: {
+      id: true,
+      url: true,
+      method: true,
+    },
+  });
+
+  // 创建 ApiDoc ID 到 { url, method } 的映射
+  const apiDocMap = new Map<string, ApiDocInfo>();
+  for (const apiDoc of apiDocs) {
+    apiDocMap.set(apiDoc.id, {
+      url: apiDoc.url,
+      method: apiDoc.method,
+    });
+  }
+
+  // 验证所有 ApiDoc 都已找到
+  for (const apiCall of optimizedApiSequence) {
+    if (!apiDocMap.has(apiCall.apiDocId)) {
+      throw new Error(`ApiDoc not found for id: ${apiCall.apiDocId}`);
+    }
+  }
+  
   // 生成新的代码
   const newCode = generateSkillCode(
     optimizedData.name || skill.name,
     optimizedData.description || skill.description,
-    optimizedData.apiSequence || definition.apiSequence
+    optimizedApiSequence,
+    apiDocMap
   );
 
   const newDefinition = createSkillDefinition(
-    optimizedData.apiSequence || definition.apiSequence,
+    optimizedApiSequence,
     newCode
   );
 

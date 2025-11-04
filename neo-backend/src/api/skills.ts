@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { orchestrateSkill } from '../ai/skill-orchestration';
-import { generateSkillCode, createSkillDefinition } from '../services/skill-code-generator';
+import { generateSkillCode, createSkillDefinition, type ApiDocInfo } from '../services/skill-code-generator';
 
 const prisma = new PrismaClient();
 
@@ -25,8 +25,40 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
     const finalName = name || orchestration.name;
     const finalDescription = description || orchestration.description;
 
+    // 查询所有相关的 ApiDoc 信息
+    const apiDocs = await prisma.apiDoc.findMany({
+      where: {
+        id: { in: orchestration.apiSequence.map(api => api.apiDocId) },
+        domain,
+      },
+      select: {
+        id: true,
+        url: true,
+        method: true,
+      },
+    });
+
+    // 创建 ApiDoc ID 到 { url, method } 的映射
+    const apiDocMap = new Map<string, ApiDocInfo>();
+    for (const apiDoc of apiDocs) {
+      apiDocMap.set(apiDoc.id, {
+        url: apiDoc.url,
+        method: apiDoc.method,
+      });
+    }
+
+    // 验证所有 ApiDoc 都已找到
+    for (const apiCall of orchestration.apiSequence) {
+      if (!apiDocMap.has(apiCall.apiDocId)) {
+        res.status(400).json({ 
+          error: `ApiDoc not found for id: ${apiCall.apiDocId}` 
+        });
+        return;
+      }
+    }
+
     // 生成 JavaScript 代码
-    const code = generateSkillCode(finalName, finalDescription, orchestration.apiSequence);
+    const code = generateSkillCode(finalName, finalDescription, orchestration.apiSequence, apiDocMap);
 
     // 创建技能定义
     const definition = createSkillDefinition(orchestration.apiSequence, code);

@@ -1,12 +1,25 @@
 import type { ApiCall, SkillDefinition } from '../models/skill-types';
 
 /**
+ * ApiDoc 信息映射类型
+ */
+export interface ApiDocInfo {
+  url: string;
+  method: string;
+}
+
+/**
  * 根据技能定义生成 JavaScript 代码
+ * @param skillName 技能名称
+ * @param skillDescription 技能描述
+ * @param apiSequence API 调用序列
+ * @param apiDocMap ApiDoc ID 到 { url, method } 的映射
  */
 export function generateSkillCode(
   skillName: string,
   skillDescription: string,
-  apiSequence: ApiCall[]
+  apiSequence: ApiCall[],
+  apiDocMap: Map<string, ApiDocInfo>
 ): string {
   // 生成 API 调用代码
   const apiCalls = apiSequence
@@ -14,6 +27,15 @@ export function generateSkillCode(
     .map((apiCall, index) => {
       const isFirst = index === 0;
       const isLast = index === apiSequence.length - 1;
+      
+      // 从 ApiDoc 映射中获取 URL 和方法
+      const apiDocInfo = apiDocMap.get(apiCall.apiDocId);
+      if (!apiDocInfo) {
+        throw new Error(`ApiDoc not found for id: ${apiCall.apiDocId}`);
+      }
+      
+      const url = apiDocInfo.url;
+      const method = apiDocInfo.method;
       
       // 生成参数映射代码
       const inputMappingCode = apiCall.inputMapping
@@ -33,8 +55,8 @@ export function generateSkillCode(
   // 步骤 ${apiCall.order}: ${apiCall.apiDocId}
   ${apiCall.condition ? `if (${apiCall.condition}) {` : ''}
   const result${index} = await api.call({
-    url: '${apiCall.apiDocId}', // TODO: 需要替换为实际 URL
-    method: 'GET',
+    url: '${url}',
+    method: '${method}',
     ${inputMappingCode ? `body: {\n${inputMappingCode}\n    },` : ''}
   });
   ${outputMappingCode ? `\n    ${outputMappingCode}` : ''}
