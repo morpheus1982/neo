@@ -49,6 +49,11 @@ async function checkSkillUpdatesBatch(
   skillVersions: Array<{ id: string; version: number }>
 ): Promise<SkillUpdateInfo[]> {
   try {
+    // 如果没有技能需要检查，直接返回空数组
+    if (!skillVersions || skillVersions.length === 0) {
+      return [];
+    }
+
     const response = await fetch(`${BACKEND_URL}/api/skills/check-updates`, {
       method: 'POST',
       headers: {
@@ -58,12 +63,20 @@ async function checkSkillUpdatesBatch(
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to check updates: ${response.statusText}`);
+      // 如果是404，说明后端可能不支持这个API或技能不存在，返回空数组而不是抛出错误
+      if (response.status === 404) {
+        console.log('[Neo] Update check API not found or skills not found, skipping update check');
+        return [];
+      }
+      // 其他错误也记录但不抛出，避免影响扩展运行
+      console.warn(`[Neo] Failed to check updates: ${response.status} ${response.statusText}`);
+      return [];
     }
 
     const data = await response.json();
     return data.data || [];
   } catch (error) {
+    // 网络错误或其他错误，记录但不抛出
     console.error('[Neo] Error checking skill updates:', error);
     return [];
   }
@@ -137,14 +150,20 @@ export async function checkAndUpdateSkills(): Promise<void> {
     const installedSkills = await getInstalledSkills();
     
     if (installedSkills.length === 0) {
-      console.log('[Neo] No installed skills found');
+      console.log('[Neo] No installed skills found, skipping update check');
       return;
     }
     
     console.log(`[Neo] Found ${installedSkills.length} installed skills`);
     
-    // 批量检查更新
+    // 批量检查更新（如果失败会返回空数组，不会抛出错误）
     const updates = await checkSkillUpdatesBatch(installedSkills);
+    
+    // 如果没有更新信息，可能是API不可用或网络问题，静默失败
+    if (!updates || updates.length === 0) {
+      console.log('[Neo] No update information available (API may be unavailable)');
+      return;
+    }
     
     // 筛选出有更新的技能
     const skillsToUpdate = updates.filter(u => u.hasUpdate);
@@ -156,29 +175,35 @@ export async function checkAndUpdateSkills(): Promise<void> {
     
     console.log(`[Neo] Found ${skillsToUpdate.length} skills with updates`);
     
-    // 更新所有有更新的技能
+    // 更新所有有更新的技能（每个技能独立处理，一个失败不影响其他）
     for (const updateInfo of skillsToUpdate) {
-      const success = await updateSkill(updateInfo.id);
-      if (success) {
-        console.log(`[Neo] Successfully updated skill: ${updateInfo.name || updateInfo.id}`);
-        
-        // 发送更新通知（可选）
-        // 可以通过 chrome.notifications API 或消息传递给 content script
-        chrome.runtime.sendMessage({
-          type: 'SKILL_UPDATED',
-          data: {
-            skillId: updateInfo.id,
-            skillName: updateInfo.name,
-            newVersion: updateInfo.latestVersion,
-          },
-        }).catch(() => {
-          // 忽略消息发送失败（可能没有 content script 监听）
-        });
+      try {
+        const success = await updateSkill(updateInfo.id);
+        if (success) {
+          console.log(`[Neo] Successfully updated skill: ${updateInfo.name || updateInfo.id}`);
+          
+          // 发送更新通知（可选）
+          // 可以通过 chrome.notifications API 或消息传递给 content script
+          chrome.runtime.sendMessage({
+            type: 'SKILL_UPDATED',
+            data: {
+              skillId: updateInfo.id,
+              skillName: updateInfo.name,
+              newVersion: updateInfo.latestVersion,
+            },
+          }).catch(() => {
+            // 忽略消息发送失败（可能没有 content script 监听）
+          });
+        }
+      } catch (error) {
+        // 单个技能更新失败不影响其他技能
+        console.error(`[Neo] Failed to update skill ${updateInfo.id}:`, error);
       }
     }
     
     console.log('[Neo] Skill update check completed');
   } catch (error) {
+    // 捕获所有未预期的错误，避免影响扩展运行
     console.error('[Neo] Error in skill update check:', error);
   }
 }
@@ -187,26 +212,42 @@ export async function checkAndUpdateSkills(): Promise<void> {
  * 设置定期更新检查
  */
 export function setupUpdateChecker(): void {
-  // 清除现有的 alarm（如果存在）
-  chrome.alarms.clear(ALARM_NAME);
-  
-  // 创建新的 alarm，每 30 分钟检查一次
-  chrome.alarms.create(ALARM_NAME, {
-    periodInMinutes: CHECK_INTERVAL_MINUTES,
-  });
-  
-  console.log(`[Neo] Skill update checker scheduled (every ${CHECK_INTERVAL_MINUTES} minutes)`);
-  
-  // 监听 alarm 事件
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === ALARM_NAME) {
-      checkAndUpdateSkills();
-    }
-  });
-  
-  // 立即执行一次检查（延迟 5 秒，等待 Service Worker 完全启动）
-  setTimeout(() => {
-    checkAndUpdateSkills();
-  }, 5000);
+  try {
+    // 清除现有的 alarm（如果存在）
+    chrome.alarms.clear(ALARM_NAME).catch(() => {
+      // 忽略清除失败
+    });
+    
+    // 创建新的 alarm，每 30 分钟检查一次
+    chrome.alarms.create(ALARM_NAME, {
+      periodInMinutes: CHECK_INTERVAL_MINUTES,
+    }).catch((error) => {
+      console.error('[Neo] Failed to create update check alarm:', error);
+      return; // 如果创建失败，不继续设置监听器
+    });
+    
+    console.log(`[Neo] Skill update checker scheduled (every ${CHECK_INTERVAL_MINUTES} minutes)`);
+    
+    // 监听 alarm 事件
+    // 注意：Service Worker 重启后需要重新设置监听器
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === ALARM_NAME) {
+        // 异步执行，不阻塞
+        checkAndUpdateSkills().catch((error) => {
+          console.error('[Neo] Error in scheduled update check:', error);
+        });
+      }
+    });
+    
+    // 立即执行一次检查（延迟 5 秒，等待 Service Worker 完全启动）
+    setTimeout(() => {
+      checkAndUpdateSkills().catch((error) => {
+        console.error('[Neo] Error in initial update check:', error);
+      });
+    }, 5000);
+  } catch (error) {
+    // 如果设置失败，记录错误但不影响扩展运行
+    console.error('[Neo] Failed to setup update checker:', error);
+  }
 }
 

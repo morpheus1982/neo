@@ -107,6 +107,8 @@ function createSkillContext(
 
 /**
  * 执行技能代码
+ * 使用动态script标签注入到页面上下文，避免CSP限制
+ * 通过postMessage在content script和页面上下文之间通信
  */
 export async function executeSkill(
   skillCode: string,
@@ -128,26 +130,148 @@ export async function executeSkill(
   const context = createSkillContext(domain, onApiCall, onStep);
   
   try {
-    // 在浏览器环境中，使用 Function 构造函数创建执行函数
-    // 这是一个简化的方案，实际生产环境应该使用更安全的沙箱方案
-    const executeFunction = new Function(
-      'context',
-      `
-      ${skillCode}
-      return execute(context);
-    `
-    );
+    // 创建一个唯一的执行ID
+    const executionId = `neo-skill-exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // 设置超时保护
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Execution timeout')), 30000);
+    let timeout: NodeJS.Timeout;
+    let messageHandler: (event: MessageEvent) => void;
+    let executionResolve: (value: any) => void;
+    let executionReject: (error: Error) => void;
+    
+    // 处理API调用
+    const handleApiCall = async (requestId: string, options: ApiCallOptions) => {
+      try {
+        const result = await onApiCall(options);
+        onStep({
+          apiCallId: options.url,
+          order: stepOrder++,
+          status: 'success',
+          requestData: options,
+          responseData: result,
+          duration: 0,
+        });
+        return result;
+      } catch (error) {
+        onStep({
+          apiCallId: options.url,
+          order: stepOrder++,
+          status: 'failed',
+          requestData: options,
+          error: error instanceof Error ? error.message : String(error),
+          duration: 0,
+        });
+        throw error;
+      }
+    };
+    
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (messageHandler) window.removeEventListener('message', messageHandler);
+    };
+    
+    // 创建一个Promise来等待执行结果
+    const executionPromise = new Promise<any>((resolve, reject) => {
+      executionResolve = resolve;
+      executionReject = reject;
+      
+      // 设置超时
+      timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Execution timeout'));
+      }, 30000);
+      
+      // 监听来自页面上下文的消息
+      messageHandler = (event: MessageEvent) => {
+        if (event.data && event.data.type === 'neo-skill-result' && event.data.executionId === executionId) {
+          cleanup();
+          if (event.data.error) {
+            reject(new Error(event.data.error));
+          } else {
+            resolve(event.data.result);
+          }
+        } else if (event.data && event.data.type === 'neo-api-call' && event.data.executionId === executionId) {
+          // 处理来自页面上下文的API调用请求
+          handleApiCall(event.data.requestId, event.data.options)
+            .then(result => {
+              window.postMessage({
+                type: 'neo-api-response',
+                executionId,
+                requestId: event.data.requestId,
+                result
+              }, '*');
+            })
+            .catch(error => {
+              window.postMessage({
+                type: 'neo-api-response',
+                executionId,
+                requestId: event.data.requestId,
+                error: error.message || String(error)
+              }, '*');
+            });
+        } else if (event.data && event.data.type === 'neo-storage-get' && event.data.executionId === executionId) {
+          // 处理storage.get请求
+          context.storage.get(event.data.key)
+            .then(value => {
+              window.postMessage({
+                type: 'neo-storage-response',
+                executionId,
+                requestId: event.data.requestId,
+                result: value
+              }, '*');
+            })
+            .catch(error => {
+              window.postMessage({
+                type: 'neo-storage-response',
+                executionId,
+                requestId: event.data.requestId,
+                error: error.message || String(error)
+              }, '*');
+            });
+        } else if (event.data && event.data.type === 'neo-storage-set' && event.data.executionId === executionId) {
+          // 处理storage.set请求
+          context.storage.set(event.data.key, event.data.value)
+            .then(() => {
+              window.postMessage({
+                type: 'neo-storage-response',
+                executionId,
+                requestId: event.data.requestId,
+                result: null
+              }, '*');
+            })
+            .catch(error => {
+              window.postMessage({
+                type: 'neo-storage-response',
+                executionId,
+                requestId: event.data.requestId,
+                error: error.message || String(error)
+              }, '*');
+            });
+        }
+      };
+      
+      window.addEventListener('message', messageHandler);
     });
     
-    // 调用 execute 函数
-    const result = await Promise.race([
-      executeFunction(context),
-      timeoutPromise,
-    ]) as any;
+    // 通过chrome.runtime.sendMessage发送到background script执行
+    chrome.runtime.sendMessage({
+      type: 'EXECUTE_SKILL',
+      data: {
+        executionId,
+        skillCode,
+      },
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        cleanup();
+        if (executionReject) executionReject(new Error(chrome.runtime.lastError.message));
+      } else if (response?.error) {
+        cleanup();
+        if (executionReject) executionReject(new Error(response.error));
+      }
+      // 成功时，等待页面上下文通过postMessage发送结果
+    });
+    
+    // 等待执行结果
+    const result = await executionPromise;
     
     const success = steps.every(s => s.status === 'success');
     

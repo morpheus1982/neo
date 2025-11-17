@@ -268,8 +268,21 @@ export async function downloadSkill(req: Request, res: Response): Promise<void> 
     const definition = skill.definition as { content?: string };
     const code = definition.content || '';
 
+    // 创建ASCII安全的fallback文件名（只保留字母、数字、连字符、下划线）
+    const safeFileName = `${skill.name}-v${skill.version}.js`
+      .replace(/[^\w\-.]/g, '_') // 将非ASCII字符和特殊字符替换为下划线
+      .replace(/_{2,}/g, '_') // 将多个连续下划线替换为单个
+      .replace(/_+-+_+|_+-+|-_+_+|-_+/g, '-') // 处理下划线和连字符的混合情况
+      .replace(/^_|_$/g, '') // 移除开头和结尾的下划线
+      .replace(/^-|-$/g, ''); // 移除开头和结尾的连字符
+    
+    // 原始文件名（用于UTF-8编码）
+    const fileName = `${skill.name}-v${skill.version}.js`;
+    const encodedFileName = encodeURIComponent(fileName);
+    
     res.setHeader('Content-Type', 'application/javascript');
-    res.setHeader('Content-Disposition', `attachment; filename="${skill.name}-v${skill.version}.js"`);
+    // 使用RFC 5987格式：ASCII安全的fallback + UTF-8编码的完整文件名
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}"; filename*=UTF-8''${encodedFileName}`);
     res.send(code);
   } catch (error) {
     throw error;

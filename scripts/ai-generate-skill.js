@@ -70,11 +70,11 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
 const SILICONFLOW_BASE_URL = process.env.SILICONFLOW_BASE_URL || 'https://api.siliconflow.cn/v1';
 
-// 技能意图（固定为小红书搜索+点赞）
+// 技能意图（GitHub搜索仓库）
 const SKILL_INTENT = {
-  name: '小红书搜索并点赞',
-  description: '搜索"激流金属"相关内容，然后给前100条内容点赞',
-  task: '在小红书搜索"激流金属"关键词，获取搜索结果，然后依次给前100条搜索结果点赞'
+  name: 'GitHub搜索AI相关仓库',
+  description: '搜索和AI相关的仓库，返回第一页结果的仓库名称',
+  task: '在GitHub搜索"AI"关键词，获取搜索结果的第一页，提取并返回所有仓库的名称'
 };
 
 /**
@@ -161,11 +161,15 @@ ${JSON.stringify(apiSummary, null, 2)}
 1. 分析任务需求，选择完成这个任务所需的API
 2. 确定API的执行顺序
 3. 说明每个API的用途和如何组合使用
+4. **重要提示：** 如果任务涉及GitHub搜索仓库，即使API列表中没有直接的搜索API，也可以使用GitHub的标准搜索API格式：
+   - 搜索仓库：\`https://api.github.com/search/repositories?q=关键词\`
+   - 或者使用GitHub网页端的搜索端点：\`https://github.com/search?q=关键词&type=repositories\`
+   - 如果API列表中有类似的搜索相关端点，优先使用列表中的API
 
 请返回JSON格式，包含以下字段：
-- selectedApiIds: 选中的API ID数组（按执行顺序）
+- selectedApiIds: 选中的API ID数组（按执行顺序）。如果列表中没有合适的搜索API，可以返回空数组[]，并在executionFlow中说明需要使用GitHub标准搜索API
 - apiUsage: 每个API的用途说明（数组，与selectedApiIds对应）
-- executionFlow: 执行流程说明
+- executionFlow: 执行流程说明。如果没有选中API，请说明需要使用哪个GitHub搜索API端点
 
 只返回JSON，不要其他文字。`;
 
@@ -403,6 +407,12 @@ ${selection.executionFlow}
 ${localStorageSummary}
 ${headerInstructionsText}
 
+**GitHub搜索API说明（如果使用GitHub搜索）：**
+- GitHub搜索API端点：\`https://api.github.com/search/repositories?q=关键词\`
+- 响应格式：\`{ total_count: number, items: [{ name: string, full_name: string, description: string, html_url: string, ... }] }\`
+- 从响应中的 \`items\` 数组提取仓库名称（\`name\` 或 \`full_name\` 字段）
+- 第一页通常包含最多30个结果（GitHub API默认每页30条）
+
 **技能代码框架要求：**
 1. 使用 async function execute(context) 作为入口函数
 2. context 包含：
@@ -410,12 +420,11 @@ ${headerInstructionsText}
    - state.get(key) / state.set(key, value): 状态管理
    - storage.get(key) / storage.set(key, value): localStorage访问（通过chrome.storage.local）
 3. 代码需要：
-   - 先搜索"激流金属"关键词
-   - 获取搜索结果（前100条）
-   - 循环给每条结果点赞
-   - 添加适当的延迟避免请求过快
+   - 搜索"AI"关键词（或相关搜索词）
+   - 获取搜索结果的第一页数据
+   - 从响应中提取仓库名称列表
    - 处理错误和异常情况
-   - 返回执行结果统计
+   - 返回包含仓库名称的执行结果
 4. **重要：Header构建**
    - 必须完整还原API记录中的所有requestHeaders
    - 根据Header构建说明，从localStorage读取需要的值
@@ -495,7 +504,7 @@ async function createSkill(domain, skillCode, selectedApiDocs, selection) {
   
   // 构建 apiSequence
   const apiSequence = selectedApiDocs.map((doc, index) => ({
-    apiDocId: doc.id,
+    apiDocId: doc.id.startsWith('github-search-api') ? `placeholder-${doc.id}` : doc.id,
     order: index + 1,
     inputMapping: {}, // LLM生成的代码中已经包含了参数，这里可以留空或让LLM生成
     outputMapping: {}, // 同上
@@ -574,11 +583,31 @@ async function main() {
     const selection = await selectApisWithLLM(openai, apiDocs, SKILL_INTENT);
     
     // 获取选中的API详细信息
-    const selectedApiDocs = selection.selectedApiIds
+    let selectedApiDocs = selection.selectedApiIds
       .map(id => apiDocs.find(doc => doc.id === id))
       .filter(Boolean);
     
-    if (selectedApiDocs.length === 0) {
+    // 如果没有选中API，但任务需要GitHub搜索，创建虚拟的搜索API文档
+    if (selectedApiDocs.length === 0 && domain === 'github.com') {
+      console.log('⚠️  未找到搜索API，使用GitHub标准搜索API格式');
+      selectedApiDocs = [{
+        id: 'github-search-api',
+        url: 'https://api.github.com/search/repositories',
+        method: 'GET',
+        docMarkdown: 'GitHub仓库搜索API。使用查询参数q进行搜索，例如：q=AI',
+        requestHeaders: {},
+        requestBody: null,
+        responseBody: {
+          total_count: 0,
+          items: [{
+            name: '仓库名称',
+            full_name: 'owner/repo',
+            description: '仓库描述',
+            html_url: 'https://github.com/owner/repo'
+          }]
+        }
+      }];
+    } else if (selectedApiDocs.length === 0) {
       throw new Error('未找到选中的API数据');
     }
     
