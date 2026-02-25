@@ -223,17 +223,64 @@ commands.capture = async function(args) {
 
     case 'detail': {
       const id = positional[1];
-      if (!id) { console.error('Usage: neo capture detail <id>'); process.exit(1); }
+      if (!id) { console.error('Usage: neo capture detail <id> [--curl] [--neo]'); process.exit(1); }
       const r = await cdpEval(wsUrl, dbEval(`
-        store.get(${JSON.stringify(id)}).onsuccess = function(e) {
-          var v = e.target.result;
-          if (!v) { resolve("Not found"); return; }
-          if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
-            v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
-          resolve(JSON.stringify(v, null, 2));
+        var targetId = ${JSON.stringify(id)};
+        // Try exact match first, then prefix match
+        store.get(targetId).onsuccess = function(e) {
+          if (e.target.result) {
+            var v = e.target.result;
+            if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
+              v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
+            resolve(JSON.stringify(v, null, 2));
+          } else {
+            // Prefix search
+            var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
+            store.openCursor(bound).onsuccess = function(e2) {
+              var c = e2.target.result;
+              if (c) {
+                var v = c.value;
+                if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
+                  v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
+                resolve(JSON.stringify(v, null, 2));
+              } else { resolve("Not found"); }
+            };
+          }
         };
       `));
-      console.log(r);
+      if (r === 'Not found') { console.log(r); break; }
+      
+      if (flags.curl || flags.neo) {
+        try {
+          const cap = JSON.parse(r);
+          if (flags.curl) {
+            // Generate curl command
+            const parts = [`curl -X ${cap.method} '${cap.url}'`];
+            for (const [k, v] of Object.entries(cap.requestHeaders || {})) {
+              if (k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') {
+                parts.push(`  -H '${k}: ${v}'`);
+              }
+            }
+            if (cap.requestBody && cap.method !== 'GET') {
+              const body = typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody);
+              parts.push(`  -d '${body.replace(/'/g, "'\\''")}'`);
+            }
+            console.log(parts.join(' \\\n'));
+          } else {
+            // Generate neo exec command
+            const parts = [`neo exec '${cap.url}'`];
+            if (cap.method !== 'GET') parts.push(`--method ${cap.method}`);
+            parts.push('--auto-headers');
+            if (cap.requestBody && cap.method !== 'GET') {
+              const body = typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody);
+              parts.push(`--body '${body.replace(/'/g, "'\\''")}'`);
+            }
+            console.log(parts.join(' '));
+          }
+        } catch { console.log(r); }
+      } else {
+        console.log(r);
+      }
       break;
     }
 
@@ -1275,10 +1322,16 @@ commands.replay = async function(args) {
   // Fetch the capture details
   const wsUrl = await findExtensionWs();
   const raw = await cdpEval(wsUrl, dbEval(`
-    store.get(${JSON.stringify(id)}).onsuccess = function(e) {
-      var v = e.target.result;
-      if (!v) { resolve("null"); return; }
-      resolve(JSON.stringify(v));
+    var targetId = ${JSON.stringify(id)};
+    store.get(targetId).onsuccess = function(e) {
+      if (e.target.result) { resolve(JSON.stringify(e.target.result)); }
+      else {
+        var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
+        store.openCursor(bound).onsuccess = function(e2) {
+          var c = e2.target.result;
+          resolve(c ? JSON.stringify(c.value) : "null");
+        };
+      }
     };
   `));
   if (raw === 'null' || !raw) { console.error(`Capture not found: ${id}`); process.exit(1); }
