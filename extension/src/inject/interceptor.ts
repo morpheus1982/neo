@@ -1,53 +1,24 @@
 import { CapturedRequest, MAX_CAPTURE_BODY_BYTES, NEO_CAPTURE_MESSAGE_TYPE } from '../types';
 import { normalizeCaptureValue } from '../utils';
-
-const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map)(?:[?#].*)?$/i;
-const ANALYTICS_KEYWORDS = [
-  'google-analytics', 'googletagmanager', 'googlesyndication', 'doubleclick',
-  'sentry.io', 'hotjar.com', 'mixpanel.com', 'segment.com', 'segment.io',
-  'amplitude.com', 'fullstory.com', 'intercom.io', 'crisp.chat',
-  'hubspot.com', 'clarity.ms', 'newrelic.com', 'datadoghq.com',
-  'bugsnag.com', 'logrocket.io', 'heapanalytics.com', 'posthog.com',
-  'connect.facebook.net', 'bat.bing.com', 'mc.yandex.ru',
-  'splunkcloud.com', 'adora-cdn.com', 'transcend-cdn.com',
-  'w3-reporting', 'proxsee.pscp.tv',
-  // Media CDNs (not API calls)
-  'video.twimg.com', 'abs.twimg.com', 'pbs.twimg.com',
-  'googlevideo.com', 'ytimg.com',
-  // More CDNs
-  'cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com',
-  'fonts.googleapis.com', 'fonts.gstatic.com',
-  // More analytics/ads
-  'analytics.google.com', 'stats.g.doubleclick.net',
-  'pagead2.googlesyndication.com', 'adservice.google.com',
-  'static.cloudflareinsights.com', 'rum.browser-intake-datadoghq.com',
-  'app.launchdarkly.com', 'events.launchdarkly.com',
-  'api.statsig.com', 'featuregates.org',
-  // Bilibili CDNs/trackers (not API calls — api.bilibili.com IS useful)
-  'hdslb.com', 'bilivideo.com', 'bilivideo.cn', 'biliapi.net',
-  'data.bilibili.com', 'cm.bilibili.com',
-  // Anthropic CDN/stats
-  'a-cdn.anthropic.com', 'a-cdn.claude.ai', 'statsig.anthropic.com',
-  // Honeycomb
-  'api.honeycomb.io',
-];
+import {
+  shouldSkipUrl,
+  getCaptureKey as getCaptureKeyBase,
+  truncateText,
+  parseTextBody,
+  parseResponseHeaders,
+  deriveDomain,
+  toAbsoluteUrl as toAbsoluteUrlBase,
+  getSelector,
+  getElementText,
+} from '../interceptor-utils';
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
 const recentCaptures = new Map<string, { count: number; lastTime: number }>();
 const DEDUP_WINDOW_MS = 60_000; // 1 minute window
 const DEDUP_MAX_PER_WINDOW = 3;  // Allow max 3 captures per URL pattern per window
 
-function getCaptureKey(method: string, url: string): string {
-  try {
-    const u = new URL(url, location.href);
-    return `${method} ${u.pathname}`;
-  } catch {
-    return `${method} ${url}`;
-  }
-}
-
 function shouldThrottle(method: string, url: string): boolean {
-  const key = getCaptureKey(method, url);
+  const key = getCaptureKeyBase(method, url, location.href);
   const now = Date.now();
   const entry = recentCaptures.get(key);
   
@@ -86,18 +57,12 @@ if (!window.__neoInterceptorInstalled) {
   let lastTrigger: { event: string; selector: string; text?: string; timestamp: number } | null = null;
   const TRIGGER_WINDOW_MS = 2000; // Associate trigger with API calls within 2 seconds
 
-  function getSelector(el: Element): string {
-    if (el.id) return `#${el.id}`;
-    const tag = el.tagName.toLowerCase();
-    const cls = el.className && typeof el.className === 'string'
-      ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')
-      : '';
-    return tag + cls;
+  function getSelector_el(el: Element): string {
+    return getSelector({ id: el.id, tagName: el.tagName, className: el.className as string });
   }
 
-  function getElementText(el: Element): string | undefined {
-    const text = (el.textContent || '').trim().slice(0, 50);
-    return text || undefined;
+  function getElementText_el(el: Element): string | undefined {
+    return getElementText(el.textContent);
   }
 
   function consumeTrigger(): CapturedRequest['trigger'] | undefined {
@@ -114,13 +79,13 @@ if (!window.__neoInterceptorInstalled) {
   document.addEventListener('click', (e) => {
     const el = e.target as Element;
     if (!el || !el.tagName) return;
-    lastTrigger = { event: 'click', selector: getSelector(el), text: getElementText(el), timestamp: Date.now() };
+    lastTrigger = { event: 'click', selector: getSelector_el(el), text: getElementText_el(el), timestamp: Date.now() };
   }, true);
 
   document.addEventListener('submit', (e) => {
     const el = e.target as Element;
     if (!el) return;
-    lastTrigger = { event: 'submit', selector: getSelector(el), text: undefined, timestamp: Date.now() };
+    lastTrigger = { event: 'submit', selector: getSelector_el(el), text: undefined, timestamp: Date.now() };
   }, true);
 
   const originalFetch = window.fetch.bind(window);
@@ -135,92 +100,28 @@ if (!window.__neoInterceptorInstalled) {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID();
     }
-
     return `neo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  function truncateText(value: string): string {
-    if (value.length <= MAX_CAPTURE_BODY_BYTES) {
-      return value;
-    }
-
-    return `${value.slice(0, MAX_CAPTURE_BODY_BYTES)}\n[truncated ${value.length - MAX_CAPTURE_BODY_BYTES} bytes]`;
-  }
-
-  function toAbsoluteUrl(url: string | URL): string {
-    try {
-      return new URL(url, location.href).toString();
-    } catch {
-      return String(url);
-    }
-  }
-
-  function deriveDomain(url: string): string {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return 'unknown';
-    }
+  // Thin wrappers over imported pure functions, binding to current page context
+  function toAbsoluteUrlLocal(url: string | URL): string {
+    return toAbsoluteUrlBase(url, location.href);
   }
 
   function shouldSkipRequest(url: string, headers: Record<string, string> = {}): boolean {
-    try {
-      const parsed = new URL(url, location.href);
-      const href = parsed.href.toLowerCase();
-      const pathname = parsed.pathname.toLowerCase();
-      const hostname = parsed.hostname.toLowerCase();
-
-      if (['chrome-extension:', 'moz-extension:', 'safari-extension:', 'data:', 'blob:'].includes(parsed.protocol)) {
-        return true;
-      }
-
-      if (STATIC_RESOURCE_EXTENSIONS.test(pathname)) {
-        return true;
-      }
-
-      const combined = `${href} ${hostname} ${JSON.stringify(headers).toLowerCase()}`;
-      return ANALYTICS_KEYWORDS.some((keyword) => combined.includes(keyword));
-    } catch {
-      return true;
-    }
+    return shouldSkipUrl(url, headers, location.href);
   }
 
   function parseHeaders(headers?: Headers | Record<string, string>): Record<string, string> {
     const result: Record<string, string> = {};
-
-    if (!headers) {
-      return result;
-    }
-
+    if (!headers) return result;
     const entries = headers instanceof Headers ? headers.entries() : Object.entries(headers);
-
-    for (const [key, value] of entries) {
-      result[key] = value;
-    }
-
+    for (const [key, value] of entries) { result[key] = value; }
     return result;
-  }
-
-  function parseTextBody(raw: string, contentType?: string): unknown {
-    const normalized = truncateText(raw);
-    const lowerType = (contentType || '').toLowerCase();
-    const looksJson = lowerType.includes('application/json') ||
-      ((raw.startsWith('{') && raw.endsWith('}')) || (raw.startsWith('[') && raw.endsWith(']')));
-
-    if (looksJson) {
-      try {
-        return JSON.parse(raw);
-      } catch {
-        return normalized;
-      }
-    }
-
-    return normalized;
   }
 
   /**
    * Normalize request/response body into a serializable form.
-   * When async=true (fetch), reads Blob contents. When sync (XHR), returns placeholder.
    */
   function normalizeBodySync(value: unknown): unknown {
     if (value == null) return undefined;
@@ -259,23 +160,6 @@ if (!window.__neoInterceptorInstalled) {
     return normalizeBodySync(value);
   }
 
-  function parseResponseHeaders(raw: string): Record<string, string> {
-    const headers: Record<string, string> = {};
-
-    for (const line of raw.split('\r\n')) {
-      const colonIndex = line.indexOf(':');
-      if (colonIndex <= 0) {
-        continue;
-      }
-
-      const key = line.slice(0, colonIndex).trim();
-      const value = line.slice(colonIndex + 1).trim();
-      headers[key] = value;
-    }
-
-    return headers;
-  }
-
   function emitCapture(payload: CapturedRequest): void {
     // Throttle high-frequency duplicate URLs
     if (shouldThrottle(payload.method, payload.url)) {
@@ -293,7 +177,7 @@ if (!window.__neoInterceptorInstalled) {
     const input = args[0];
     const startedAt = Date.now();
     const startPerf = performance.now();
-    const url = toAbsoluteUrl(input instanceof Request ? input.url : (input as string | URL));
+    const url = toAbsoluteUrlLocal(input instanceof Request ? input.url : (input as string | URL));
     const method = ((typeof input !== 'string' && !(input instanceof URL) && init?.method)
       ? init.method
       : (input instanceof Request ? input.method : (init?.method || 'GET'))
@@ -415,7 +299,7 @@ if (!window.__neoInterceptorInstalled) {
   originalXHRProto.open = function open(this: XMLHttpRequest, method: string, url: string | URL, ...rest: any[]) {
     const meta: XHRSnapshot = {
       method: method?.toUpperCase() || 'GET',
-      url: toAbsoluteUrl(url),
+      url: toAbsoluteUrlLocal(url),
       headers: {},
       body: undefined,
       startedAt: 0,
@@ -440,7 +324,7 @@ if (!window.__neoInterceptorInstalled) {
     const meta = (this as any)[XHR_META_KEY] as XHRSnapshot | undefined;
     const requestMeta = meta || ({
       method: 'GET',
-      url: toAbsoluteUrl(''),
+      url: toAbsoluteUrlLocal(''),
       headers: {},
       body: undefined,
       startedAt: 0,
