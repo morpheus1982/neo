@@ -9,6 +9,11 @@ const ANALYTICS_KEYWORDS = [
   'hubspot.com', 'clarity.ms', 'newrelic.com', 'datadoghq.com',
   'bugsnag.com', 'logrocket.io', 'heapanalytics.com', 'posthog.com',
   'connect.facebook.net', 'bat.bing.com', 'mc.yandex.ru',
+  'splunkcloud.com', 'adora-cdn.com', 'transcend-cdn.com',
+  'w3-reporting', 'proxsee.pscp.tv',
+  // Media CDNs (not API calls)
+  'video.twimg.com', 'abs.twimg.com', 'pbs.twimg.com',
+  'googlevideo.com', 'ytimg.com',
 ];
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
