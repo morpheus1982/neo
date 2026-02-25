@@ -29,33 +29,22 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 // ─── CDP Helpers ────────────────────────────────────────────────
 
 async function findExtensionWs() {
-  let tabs;
-  try {
-    const resp = await fetch(`${CDP_URL}/json/list`);
-    tabs = await resp.json();
-  } catch (err) {
-    throw new Error(`Cannot connect to Chrome DevTools at ${CDP_URL}. Is Chrome running with --remote-debugging-port=9222?`);
-  }
-  const sw = tabs.find(t => t.url.includes(NEO_EXTENSION_ID));
-  if (!sw) throw new Error(`Neo extension service worker not found (ID: ${NEO_EXTENSION_ID}). Is the extension installed and enabled?`);
+  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+  // Must match the service_worker, not the extensions page
+  const sw = tabs.find(t => t.type === 'service_worker' && t.url.includes(NEO_EXTENSION_ID));
+  if (!sw) throw new Error('Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222');
   return sw.webSocketDebuggerUrl;
 }
 
 async function findTab(pattern) {
-  let tabs;
-  try {
-    const resp = await fetch(`${CDP_URL}/json/list`);
-    tabs = await resp.json();
-  } catch (err) {
-    throw new Error(`Cannot connect to Chrome DevTools at ${CDP_URL}. Is Chrome running with --remote-debugging-port=9222?`);
-  }
+  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
   if (pattern) {
     const tab = tabs.find(t => t.type === 'page' && t.url.includes(pattern));
-    if (!tab) throw new Error(`No tab matching "${pattern}". Open tabs: ${tabs.filter(t => t.type === 'page').map(t => t.url).join(', ') || '(none)'}`);
+    if (!tab) throw new Error(`No tab matching "${pattern}"`);
     return tab;
   }
   const pages = tabs.filter(t => t.type === 'page');
-  if (!pages.length) throw new Error('No browser tabs found. Open a page in Chrome first.');
+  if (!pages.length) throw new Error('No browser tabs found');
   return pages[0];
 }
 
@@ -84,7 +73,7 @@ function cdpEval(wsUrl, expression, timeout = 30000) {
         }
       }
     });
-    ws.on('error', err => { clearTimeout(timer); reject(new Error(`CDP WebSocket error: ${err.message}`)); });
+    ws.on('error', err => { clearTimeout(timer); reject(err); });
   });
 }
 
@@ -287,7 +276,7 @@ commands.capture = async function(args) {
                 var v = c.value;
                 if (v.timestamp <= since) { resolve(JSON.stringify(rows)); return; }
                 if (!domain || v.domain === domain) {
-                  rows.push({ method: v.method, status: v.responseStatus, url: v.url, duration: v.duration, timestamp: v.timestamp });
+                  rows.push({ method: v.method, status: v.responseStatus, url: v.url, duration: v.duration, timestamp: v.timestamp, source: v.source || 'fetch' });
                 }
                 c.continue();
               } else { resolve(JSON.stringify(rows)); }
@@ -296,7 +285,8 @@ commands.capture = async function(args) {
           const items = JSON.parse(r);
           for (const item of items.reverse()) {
             const time = new Date(item.timestamp).toLocaleTimeString();
-            console.log(`${time}  ${item.method} ${item.status} ${item.url.slice(0, 100)} (${item.duration}ms)`);
+            const src = item.source === 'websocket' ? ' [ws]' : '';
+            console.log(`${time}  ${item.method} ${item.status} ${item.url.slice(0, 100)} (${item.duration}ms)${src}`);
             if (item.timestamp > lastTimestamp) lastTimestamp = item.timestamp;
           }
         } catch {}
