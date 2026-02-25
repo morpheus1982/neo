@@ -65,9 +65,12 @@ node tools/neo.cjs capture list --since 1h             # Time-filtered
 node tools/neo.cjs capture domains
 node tools/neo.cjs capture search "CreateTweet" --method POST
 node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
+node tools/neo.cjs capture stats x.com           # Method/status/timing breakdown
 node tools/neo.cjs capture export x.com --since 2h > x-captures.json
 node tools/neo.cjs capture import x-captures.json     # Import captures from file
 node tools/neo.cjs capture prune --older-than 7d       # Delete old captures
+node tools/neo.cjs capture gc x.com              # Smart dedup (keep one per pattern)
+node tools/neo.cjs capture gc x.com --dry-run    # Preview what would be removed
 
 # Replay a captured API call
 node tools/neo.cjs replay <capture-id> --tab x.com
@@ -103,6 +106,9 @@ node tools/neo.cjs bridge --interactive      # Send commands to extension
 
 # Diagnostics
 node tools/neo.cjs doctor                    # Check Chrome, extension, schemas, bridge
+node tools/neo.cjs reload                    # Reload the extension from CLI
+node tools/neo.cjs tabs                      # List open Chrome tabs
+node tools/neo.cjs tabs github               # Filter tabs by URL/title
 ```
 
 The bridge creates a persistent WebSocket channel between the extension and CLI. The extension auto-connects to `ws://127.0.0.1:9234` and streams every capture in real-time. In interactive mode, you can query the extension directly: `ping`, `status`, `capture.count`, `capture.list`, `capture.domains`, `capture.search`, `capture.clear`.
@@ -230,6 +236,8 @@ The interceptor ignores noise automatically:
 - [x] Flow analysis: `neo flows` discovers API call sequences
 - [x] Schema versioning with diff detection and history
 - [x] Diagnostics: `neo doctor` for setup verification
+- [x] Body field variability: schema tracks constant vs variable request fields
+- [x] Pure function extraction + 47 unit tests + CI
 - [ ] Dual-channel: Neo API-first → browser-use fallback
 - [ ] Multi-step workflow replay
 
