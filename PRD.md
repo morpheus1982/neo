@@ -58,7 +58,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 **CLI (统一 `neo.cjs`)**
 - `neo status` — 扩展连接状态
 - `neo capture list/count/detail/clear/watch/stats/summary/search/export/import/prune/gc` — 完整捕获管理
-- `neo schema generate/list/show` — Schema 生成和查看（支持版本 diff 和 history 归档）
+- `neo schema generate/list/show/search/openapi` — Schema 生成、查看、搜索、OpenAPI 3.0 导出（支持 `--all` 批量生成、版本 diff、history 归档）
 - `neo exec` — API 执行
 - `neo replay` — 捕获重放
 - `neo eval` — JS 执行
@@ -85,21 +85,24 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - NDJSON output mode for piping into other tools
 
 **已生成 Schema**
-- GitHub (17 endpoints), YouTube (14), Reddit (18), X/Twitter (GraphQL), Linear (1), Notion (2), Bilibili (28)
+- GitHub (17 endpoints), YouTube (14), Reddit (18), X/Twitter (GraphQL), Linear (1), Notion (2), Bilibili (28), Claude.ai (2), + 6 more domains
 
 **代码质量**
 - TypeScript strict mode，零 tsc errors
-- 纯函数提取到 `interceptor-utils.ts`，47 个单元测试
+- 纯函数提取到 `interceptor-utils.ts`，54 个单元测试
 - GitHub Actions CI (typecheck + test + build)
-- interceptor.ts 673 行，neo.cjs 1544 行
+- HAR 1.2 导出格式 (Postman/Charles/devtools 互操作)
+- OpenAPI 3.0 spec 生成 (Swagger/API 工具互操作)
 
 ### 🔲 待做
 
 **近期**
 - [x] WebSocket Bridge — 实时推送捕获数据，双向命令通道（`neo bridge`）
+- [x] `neo capture export --format har` — HAR 1.2 标准格式导出
+- [x] `neo schema openapi` — OpenAPI 3.0 spec 生成
+- [x] `neo schema generate --all` — 批量 schema 生成
 - [ ] Schema 增量更新 — 避免大数据量重新分析
 - [ ] 更多网站实战测试和 schema 积累
-- [ ] `neo capture export` 格式标准化（跨设备迁移）
 
 **中期**
 - [ ] 双通道自动切换 — Neo 优先 → browser-use fallback
