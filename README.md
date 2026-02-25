@@ -67,6 +67,7 @@ node tools/neo.cjs capture search "CreateTweet" --method POST
 node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
 node tools/neo.cjs capture stats x.com           # Method/status/timing breakdown
 node tools/neo.cjs capture export x.com --since 2h > x-captures.json
+node tools/neo.cjs capture export x.com --format har > x.har  # HAR 1.2 for Postman/devtools
 node tools/neo.cjs capture import x-captures.json     # Import captures from file
 node tools/neo.cjs capture prune --older-than 7d       # Delete old captures
 node tools/neo.cjs capture gc x.com              # Smart dedup (keep one per pattern)
@@ -78,8 +79,10 @@ node tools/neo.cjs replay <capture-id> --tab x.com
 # API schema (auto-saves to local knowledge base)
 node tools/neo.cjs schema list                   # List all known schemas
 node tools/neo.cjs schema generate x.com         # Generate from captures
+node tools/neo.cjs schema generate --all         # Batch generate for all domains
 node tools/neo.cjs schema show x.com             # Human-readable summary
 node tools/neo.cjs schema show x.com --json      # Raw JSON
+node tools/neo.cjs schema openapi x.com          # Export as OpenAPI 3.0 spec
 
 # Execute API calls (auth headers auto-detected from captures)
 node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
@@ -238,6 +241,9 @@ The interceptor ignores noise automatically:
 - [x] Diagnostics: `neo doctor` for setup verification
 - [x] Body field variability: schema tracks constant vs variable request fields
 - [x] Pure function extraction + 47 unit tests + CI
+- [x] HAR 1.2 export format for Postman/Charles/devtools interop
+- [x] OpenAPI 3.0 spec generation from captured schemas
+- [x] Batch schema generation (`--all`)
 - [ ] Dual-channel: Neo API-first → browser-use fallback
 - [ ] Multi-step workflow replay
 
