@@ -1955,6 +1955,216 @@ Groups endpoints by category and suggests high-level capabilities.`);
   }
 };
 
+// neo deps — discover API dependency chains (response fields → request fields)
+commands.deps = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  const domain = positional[0];
+  if (!domain) {
+    console.log(`Usage: neo deps <domain> [--window <ms>] [--min-confidence <n>]
+
+Discover data flow between endpoints: which response fields feed into
+subsequent request parameters. Analyzes temporal sequences of captures
+to find value propagation patterns.
+
+Options:
+  --window <ms>          Max time between producer→consumer (default: 10000)
+  --min-confidence <n>   Min occurrences to report a link (default: 2)`);
+    return;
+  }
+
+  const windowMs = parseInt(flags.window) || 10000;
+  const minConf = parseInt(flags['min-confidence'] || flags.minConfidence) || 2;
+
+  const wsUrl = await findExtensionWs();
+
+  // Fetch captures with response/request bodies for dependency analysis
+  const rawData = await cdpEval(wsUrl, `
+    (async () => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open("${DB_NAME}");
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("${STORE_NAME}", "readonly");
+        const store = tx.objectStore("${STORE_NAME}");
+        const idx = store.index("domain");
+        const results = [];
+        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+          const cursor = e.target.result;
+          if (cursor) {
+            const v = cursor.value;
+            // Only include successful responses with parseable bodies
+            if (v.responseStatus >= 200 && v.responseStatus < 400) {
+              var respVals = null, reqVals = null;
+              // Extract leaf string/number values from response (1 level deep)
+              try {
+                var body = typeof v.responseBody === 'string' ? JSON.parse(v.responseBody) : v.responseBody;
+                if (body && typeof body === 'object') {
+                  respVals = {};
+                  function extract(obj, prefix) {
+                    if (!obj || typeof obj !== 'object') return;
+                    for (var k in obj) {
+                      if (!obj.hasOwnProperty(k)) continue;
+                      var val = obj[k];
+                      var path = prefix ? prefix + '.' + k : k;
+                      if (val === null || val === undefined) continue;
+                      if (typeof val === 'string' && val.length >= 3 && val.length <= 200) {
+                        respVals[path] = val;
+                      } else if (typeof val === 'number' && val > 0) {
+                        respVals[path] = String(val);
+                      } else if (typeof val === 'object' && !Array.isArray(val)) {
+                        extract(val, path);
+                      } else if (Array.isArray(val) && val.length > 0 && val.length <= 5) {
+                        for (var i = 0; i < Math.min(val.length, 3); i++) {
+                          if (typeof val[i] === 'string' && val[i].length >= 3) {
+                            respVals[path + '[' + i + ']'] = val[i];
+                          } else if (val[i] && typeof val[i] === 'object') {
+                            extract(val[i], path + '[0]');
+                          }
+                        }
+                      }
+                    }
+                  }
+                  extract(body, '');
+                }
+              } catch(ex) {}
+              // Extract values from request body + URL params
+              try {
+                var rb = typeof v.requestBody === 'string' ? JSON.parse(v.requestBody) : v.requestBody;
+                if (rb && typeof rb === 'object') {
+                  reqVals = {};
+                  function extractReq(obj, prefix) {
+                    if (!obj || typeof obj !== 'object') return;
+                    for (var k in obj) {
+                      if (!obj.hasOwnProperty(k)) continue;
+                      var val = obj[k];
+                      var path = prefix ? prefix + '.' + k : k;
+                      if (typeof val === 'string' && val.length >= 3 && val.length <= 200) {
+                        reqVals[path] = val;
+                      } else if (typeof val === 'number' && val > 0) {
+                        reqVals[path] = String(val);
+                      } else if (typeof val === 'object' && !Array.isArray(val)) {
+                        extractReq(val, path);
+                      }
+                    }
+                  }
+                  extractReq(rb, '');
+                }
+              } catch(ex) {}
+              // Also extract URL params as request values
+              try {
+                var u = new URL(v.url);
+                if (!reqVals) reqVals = {};
+                u.searchParams.forEach(function(val, key) {
+                  if (val.length >= 3) reqVals['query.' + key] = val;
+                });
+              } catch(ex) {}
+
+              results.push({
+                method: v.method,
+                url: v.url,
+                timestamp: v.timestamp,
+                respVals: respVals,
+                reqVals: reqVals
+              });
+            }
+            cursor.continue();
+          } else {
+            resolve(results);
+          }
+        };
+        tx.onerror = () => reject(tx.error);
+      });
+    })()
+  `, 60000);
+
+  if (!rawData || rawData.length < 2) {
+    console.error(`Not enough captures for ${domain} to detect dependencies`);
+    return;
+  }
+
+  // Sort by timestamp
+  rawData.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Normalize URL for display
+  function normEndpoint(url, method) {
+    try {
+      const u = new URL(url);
+      let p = u.pathname;
+      p = p.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
+      p = p.replace(/\/\d{4,}\b/g, '/:id');
+      return `${method} ${p}`;
+    } catch { return `${method} ${url}`; }
+  }
+
+  // Find value propagation: response field of A appears in request field of B
+  const links = new Map(); // "producerEndpoint → consumerEndpoint | respField → reqField" → count
+
+  for (let i = 0; i < rawData.length; i++) {
+    const producer = rawData[i];
+    if (!producer.respVals || Object.keys(producer.respVals).length === 0) continue;
+
+    // Look at subsequent captures within the window
+    for (let j = i + 1; j < rawData.length; j++) {
+      const consumer = rawData[j];
+      if (consumer.timestamp - producer.timestamp > windowMs) break;
+      if (!consumer.reqVals || Object.keys(consumer.reqVals).length === 0) continue;
+
+      const prodEp = normEndpoint(producer.url, producer.method);
+      const consEp = normEndpoint(consumer.url, consumer.method);
+      if (prodEp === consEp) continue; // Skip self-references
+
+      // Check if any response value appears in request values
+      for (const [respField, respVal] of Object.entries(producer.respVals)) {
+        // Skip very common values (booleans, small numbers, generic strings)
+        if (['true', 'false', 'null', 'undefined', '0', '1', '2'].includes(respVal)) continue;
+        if (respVal.length < 5) continue; // Too short to be meaningful
+
+        for (const [reqField, reqVal] of Object.entries(consumer.reqVals)) {
+          if (respVal === reqVal) {
+            const key = `${prodEp}|${consEp}|${respField}|${reqField}`;
+            links.set(key, (links.get(key) || 0) + 1);
+          }
+        }
+      }
+    }
+  }
+
+  // Filter by confidence and group by endpoint pair
+  const pairLinks = new Map(); // "producer → consumer" → [{respField, reqField, count}]
+  for (const [key, count] of links) {
+    if (count < minConf) continue;
+    const [prodEp, consEp, respField, reqField] = key.split('|');
+    const pairKey = `${prodEp} → ${consEp}`;
+    if (!pairLinks.has(pairKey)) pairLinks.set(pairKey, []);
+    pairLinks.get(pairKey).push({ respField, reqField, count });
+  }
+
+  if (pairLinks.size === 0) {
+    console.log(`No dependency chains found for ${domain} (window: ${windowMs}ms, min: ${minConf}x)`);
+    console.log(`  Analyzed ${rawData.length} captures`);
+    console.log(`  Tip: try --window 30000 for slower workflows or --min-confidence 1`);
+    return;
+  }
+
+  // Sort pairs by total evidence
+  const sortedPairs = [...pairLinks.entries()]
+    .map(([pair, fields]) => ({ pair, fields, total: fields.reduce((s, f) => s + f.count, 0) }))
+    .sort((a, b) => b.total - a.total);
+
+  console.log(`API dependency chains for ${domain} (${sortedPairs.length} links found)\n`);
+  for (const { pair, fields, total } of sortedPairs.slice(0, 20)) {
+    console.log(`  ${pair}  (${total}x)`);
+    // Sort fields by count, show top 5
+    fields.sort((a, b) => b.count - a.count);
+    for (const f of fields.slice(0, 5)) {
+      console.log(`    .${f.respField} → .${f.reqField}  (${f.count}x)`);
+    }
+    console.log();
+  }
+};
+
 // neo mock — generate a mock HTTP server from schema
 commands.mock = async function(args) {
   const { positional, flags } = parseArgs(args || []);
@@ -2194,6 +2404,7 @@ Commands:
   neo tabs [filter]                       List open Chrome tabs
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
+  neo deps <domain> [--window ms]         Discover API dependency chains (response→request)
   neo suggest <domain>                    Suggest AI capabilities for a domain
   neo mock <domain> [--port N]            Generate mock server from schema
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
