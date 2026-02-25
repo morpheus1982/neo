@@ -84,7 +84,15 @@ node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"k
 node tools/neo.cjs read github.com
 node tools/neo.cjs eval "document.title" --tab github.com
 node tools/neo.cjs open https://example.com
+
+# WebSocket Bridge (real-time streaming)
+node tools/neo.cjs bridge                    # Start bridge, see captures live
+node tools/neo.cjs bridge --json             # NDJSON output for piping
+node tools/neo.cjs bridge --json | jq .      # Structured processing
+node tools/neo.cjs bridge --interactive      # Send commands to extension
 ```
+
+The bridge creates a persistent WebSocket channel between the extension and CLI. The extension auto-connects to `ws://127.0.0.1:9234` and streams every capture in real-time. In interactive mode, you can query the extension directly: `ping`, `status`, `capture.count`, `capture.list`, `capture.domains`, `capture.search`, `capture.clear`.
 
 ## Architecture
 
@@ -106,7 +114,9 @@ node tools/neo.cjs open https://example.com
 │                                      │
 │  background/index.ts                 │
 │    ├─ Persists to IndexedDB (Dexie)  │
-│    └─ Per-domain cap (500 entries)   │
+│    ├─ Per-domain cap (500 entries)   │
+│    └─ WebSocket Bridge client        │
+│       (auto-connects to bridge)      │
 │                                      │
 │  popup/ — Capture viewer UI          │
 └──────────────┬──────────────────────┘
