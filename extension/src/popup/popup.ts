@@ -12,12 +12,24 @@ const requestDetailEl = document.getElementById('requestDetail') as HTMLPreEleme
 const requestTitleEl = document.getElementById('requestTitle') as HTMLHeadingElement;
 const summaryEl = document.getElementById('summary') as HTMLSpanElement;
 const refreshBtn = document.getElementById('refreshBtn') as HTMLButtonElement;
+const copyButtonsEl = document.getElementById('copyButtons') as HTMLDivElement;
+const copyCurlBtn = document.getElementById('copyCurlBtn') as HTMLButtonElement;
+const copyNeoBtn = document.getElementById('copyNeoBtn') as HTMLButtonElement;
 
 let activeDomain: string | null = null;
 let currentCalls: CapturedRequest[] = [];
+let selectedCall: CapturedRequest | null = null;
 
 refreshBtn.addEventListener('click', () => {
   void render();
+});
+
+copyCurlBtn.addEventListener('click', () => {
+  if (selectedCall) copyToClipboard(toCurl(selectedCall), copyCurlBtn);
+});
+
+copyNeoBtn.addEventListener('click', () => {
+  if (selectedCall) copyToClipboard(toNeoExec(selectedCall), copyNeoBtn);
 });
 
 void render();
@@ -103,6 +115,8 @@ async function renderCallsForDomain(domain: string): Promise<void> {
     `;
 
     button.addEventListener('click', () => {
+      selectedCall = call;
+      copyButtonsEl.style.display = 'flex';
       requestDetailEl.textContent = JSON.stringify(formatForDisplay(call), null, 2);
       [...requestListEl.querySelectorAll('.call-item')].forEach((element) => {
         (element as HTMLButtonElement).style.background = '';
@@ -114,6 +128,8 @@ async function renderCallsForDomain(domain: string): Promise<void> {
   }
 
   requestDetailEl.textContent = JSON.stringify(formatForDisplay(currentCalls[0]), null, 2);
+  selectedCall = currentCalls[0];
+  copyButtonsEl.style.display = 'flex';
 }
 
 function formatForDisplay(call: CapturedRequest): Record<string, unknown> {
@@ -147,4 +163,57 @@ function escapeHtml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function shellEscape(s: string): string {
+  if (/^[a-zA-Z0-9_\-./=:@]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function toCurl(call: CapturedRequest): string {
+  const parts = ['curl'];
+  if (call.method.toUpperCase() !== 'GET') {
+    parts.push(`-X ${call.method.toUpperCase()}`);
+  }
+  parts.push(shellEscape(call.url));
+
+  const skipHeaders = new Set(['host', 'content-length', 'connection']);
+  for (const [k, v] of Object.entries(call.requestHeaders || {})) {
+    if (!skipHeaders.has(k.toLowerCase())) {
+      parts.push(`-H ${shellEscape(`${k}: ${v}`)}`);
+    }
+  }
+
+  if (call.requestBody) {
+    const body = typeof call.requestBody === 'string' ? call.requestBody : JSON.stringify(call.requestBody);
+    parts.push(`-d ${shellEscape(body)}`);
+  }
+
+  return parts.join(' \\\n  ');
+}
+
+function toNeoExec(call: CapturedRequest): string {
+  const parts = ['neo exec'];
+  parts.push(call.method.toUpperCase());
+  parts.push(shellEscape(call.url));
+  parts.push('--auto-headers');
+
+  if (call.requestBody) {
+    const body = typeof call.requestBody === 'string' ? call.requestBody : JSON.stringify(call.requestBody);
+    parts.push(`--body ${shellEscape(body)}`);
+  }
+
+  return parts.join(' \\\n  ');
+}
+
+function copyToClipboard(text: string, btn: HTMLButtonElement): void {
+  void navigator.clipboard.writeText(text).then(() => {
+    const original = btn.textContent;
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.classList.remove('copied');
+    }, 1500);
+  });
 }
