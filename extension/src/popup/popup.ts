@@ -105,10 +105,13 @@ async function renderCallsForDomain(domain: string): Promise<void> {
   for (const call of currentCalls) {
     const button = document.createElement('button');
     button.className = 'call-item';
+    const isWs = call.method.startsWith('WS_');
+    const methodLabel = isWs ? `🔌 ${call.method}` : call.method.toUpperCase();
+    const statusLabel = isWs ? '' : `<span class="domain-count">${call.responseStatus || 0}</span>`;
     button.innerHTML = `
       <div>
-        <strong>${escapeHtml(call.method.toUpperCase())}</strong>
-        <span class="domain-count">${call.responseStatus || 0}</span>
+        <strong${isWs ? ' style="color:#a78bfa"' : ''}>${escapeHtml(methodLabel)}</strong>
+        ${statusLabel}
         <span style="float:right">${formatTime(call.timestamp)}</span>
       </div>
       <div class="call-url">${escapeHtml(call.url)}</div>
@@ -116,7 +119,8 @@ async function renderCallsForDomain(domain: string): Promise<void> {
 
     button.addEventListener('click', () => {
       selectedCall = call;
-      copyButtonsEl.style.display = 'flex';
+      const isWsCall = call.method.startsWith('WS_');
+      copyButtonsEl.style.display = isWsCall ? 'none' : 'flex';
       requestDetailEl.textContent = JSON.stringify(formatForDisplay(call), null, 2);
       [...requestListEl.querySelectorAll('.call-item')].forEach((element) => {
         (element as HTMLButtonElement).style.background = '';
