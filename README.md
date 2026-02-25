@@ -59,10 +59,13 @@ Single CLI, subcommand-style (inspired by [notion-cli](https://github.com/4ier/n
 node tools/neo.cjs status
 
 # Captured traffic
-node tools/neo.cjs capture list github.com --limit 10
+node tools/neo.cjs capture summary                    # Quick overview
+node tools/neo.cjs capture list github.com --limit 10  # Shows IDs for replay/detail
+node tools/neo.cjs capture list --since 1h             # Time-filtered
 node tools/neo.cjs capture domains
+node tools/neo.cjs capture search "CreateTweet" --method POST
 node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
-node tools/neo.cjs capture export x.com > x-captures.json
+node tools/neo.cjs capture export x.com --since 2h > x-captures.json
 node tools/neo.cjs capture import x-captures.json     # Import captures from file
 
 # Replay a captured API call
