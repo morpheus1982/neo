@@ -282,113 +282,94 @@ commands.schema = async function(args) {
       if (!domain) { console.error('Usage: neo schema generate <domain>'); process.exit(1); }
       
       const wsUrl = await findExtensionWs();
-      // Fetch captures for this domain
-      const raw = await cdpEval(wsUrl, dbEval(`
-        var rows = [];
-        var idx = store.index("domain");
-        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            // Strip large bodies for schema analysis
-            var entry = {
-              method: v.method, url: v.url, domain: v.domain,
-              requestHeaders: v.requestHeaders || {},
-              responseStatus: v.responseStatus,
-              responseHeaders: v.responseHeaders || {},
-              duration: v.duration,
-              requestBody: null, responseBody: null
-            };
-            // Keep small bodies for structure analysis
-            if (v.requestBody) {
-              var rb = typeof v.requestBody === "string" ? v.requestBody : JSON.stringify(v.requestBody);
-              entry.requestBody = rb.length > 500 ? rb.slice(0, 500) : rb;
+      // Run schema analysis INSIDE the browser to avoid transferring raw captures
+      const schemaJson = await cdpEval(wsUrl, `new Promise(function(resolve) {
+        var req = indexedDB.open("${DB_NAME}");
+        req.onsuccess = function() {
+          var db = req.result;
+          var tx = db.transaction("${STORE_NAME}", "readonly");
+          var store = tx.objectStore("${STORE_NAME}");
+          var idx = store.index("domain");
+          var endpoints = {};
+          var total = 0;
+          var authKeys = ['authorization', 'x-csrf-token', 'x-twitter-auth-type',
+            'x-requested-with', 'x-github-client-version'];
+          
+          idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) {
+              var v = c.value;
+              total++;
+              try {
+                var u = new URL(v.url);
+                var key = v.method + " " + u.pathname;
+                if (!endpoints[key]) {
+                  endpoints[key] = {
+                    method: v.method, path: u.pathname,
+                    queryParams: {}, statusCodes: {},
+                    headers: {}, durations: [], count: 0, responseType: null
+                  };
+                }
+                var ep = endpoints[key];
+                ep.count++;
+                u.searchParams.forEach(function(val, k) { ep.queryParams[k] = true; });
+                ep.statusCodes[v.responseStatus] = (ep.statusCodes[v.responseStatus] || 0) + 1;
+                if (v.duration) ep.durations.push(v.duration);
+                var rh = v.requestHeaders || {};
+                for (var hk in rh) {
+                  var lk = hk.toLowerCase();
+                  if (authKeys.some(function(ak) { return lk.indexOf(ak.replace(/-/g, '')) >= 0 || lk === ak; })) {
+                    ep.headers[hk] = rh[hk];
+                  }
+                }
+                var ct = (v.responseHeaders || {})['content-type'] || '';
+                if (ct.indexOf('json') >= 0) ep.responseType = 'json';
+                else if (ct.indexOf('html') >= 0) ep.responseType = 'html';
+                else if (ct.indexOf('text') >= 0) ep.responseType = 'text';
+              } catch(ex) {}
+              c.continue();
+            } else {
+              // Build final schema
+              var epList = Object.values(endpoints).sort(function(a,b) { return b.count - a.count; });
+              var result = {
+                domain: ${JSON.stringify(domain)},
+                generatedAt: new Date().toISOString(),
+                totalCaptures: total,
+                uniqueEndpoints: epList.length,
+                endpoints: epList.map(function(ep) {
+                  var avg = ep.durations.length
+                    ? Math.round(ep.durations.reduce(function(a,b){return a+b;},0) / ep.durations.length) + 'ms'
+                    : null;
+                  return {
+                    method: ep.method, path: ep.path, callCount: ep.count,
+                    queryParams: Object.keys(ep.queryParams),
+                    statusCodes: ep.statusCodes,
+                    avgDuration: avg,
+                    authHeaders: Object.keys(ep.headers).length
+                      ? Object.keys(ep.headers)  // Only store header NAMES, not values
+                      : undefined,
+                    responseType: ep.responseType
+                  };
+                })
+              };
+              resolve(JSON.stringify(result));
             }
-            if (v.responseBody) {
-              var rsb = typeof v.responseBody === "string" ? v.responseBody : JSON.stringify(v.responseBody);
-              entry.responseBody = rsb.length > 500 ? rsb.slice(0, 500) : rsb;
-            }
-            rows.push(entry);
-            c.continue();
-          } else { resolve(JSON.stringify(rows)); }
+          };
         };
-      `), 30000);
+        req.onerror = function() { resolve(JSON.stringify({error: "DB open failed"})); };
+        setTimeout(function() { resolve(JSON.stringify({error: "timeout"})); }, 30000);
+      })`, 35000);
       
-      let captures;
-      try { captures = JSON.parse(raw); } catch { console.error('Failed to parse captures'); process.exit(1); }
-      if (!captures.length) { console.error(`No captures for ${domain}`); process.exit(1); }
-      
-      // Analyze captures into schema
-      const endpoints = new Map();
-      for (const cap of captures) {
-        const url = new URL(cap.url);
-        const pathKey = `${cap.method} ${url.pathname}`;
-        if (!endpoints.has(pathKey)) {
-          endpoints.set(pathKey, {
-            method: cap.method,
-            path: url.pathname,
-            queryParams: new Set(),
-            statusCodes: {},
-            headers: {},
-            durations: [],
-            count: 0,
-            responseType: null,
-          });
-        }
-        const ep = endpoints.get(pathKey);
-        ep.count++;
-        
-        // Query params
-        for (const k of url.searchParams.keys()) ep.queryParams.add(k);
-        
-        // Status codes
-        ep.statusCodes[cap.responseStatus] = (ep.statusCodes[cap.responseStatus] || 0) + 1;
-        
-        // Auth-relevant headers
-        const authHeaders = ['authorization', 'x-csrf-token', 'x-twitter-auth-type',
-          'x-requested-with', 'x-github-client-version', 'cookie'];
-        for (const [k, v] of Object.entries(cap.requestHeaders)) {
-          if (authHeaders.some(ah => k.toLowerCase().includes(ah.toLowerCase().replace('-', '')))) {
-            ep.headers[k] = v;
-          }
-        }
-        
-        // Duration
-        if (cap.duration) ep.durations.push(cap.duration);
-        
-        // Response type
-        const ct = cap.responseHeaders['content-type'] || '';
-        if (ct.includes('json')) ep.responseType = 'json';
-        else if (ct.includes('text')) ep.responseType = 'text';
-        else if (ct.includes('html')) ep.responseType = 'html';
-      }
-      
-      const schema = {
-        domain,
-        generatedAt: new Date().toISOString(),
-        totalCaptures: captures.length,
-        uniqueEndpoints: endpoints.size,
-        endpoints: Array.from(endpoints.values())
-          .sort((a, b) => b.count - a.count)
-          .map(ep => ({
-            method: ep.method,
-            path: ep.path,
-            callCount: ep.count,
-            queryParams: Array.from(ep.queryParams),
-            statusCodes: ep.statusCodes,
-            avgDuration: ep.durations.length
-              ? Math.round(ep.durations.reduce((a, b) => a + b, 0) / ep.durations.length) + 'ms'
-              : null,
-            authHeaders: Object.keys(ep.headers).length ? ep.headers : undefined,
-            responseType: ep.responseType,
-          }))
-      };
+      let schema;
+      try { schema = JSON.parse(schemaJson); } catch { console.error('Failed to parse schema result'); process.exit(1); }
+      if (schema.error) { console.error('Error:', schema.error); process.exit(1); }
+      if (!schema.totalCaptures) { console.error(`No captures for ${domain}`); process.exit(1); }
       
       // Save to schema dir
       fs.mkdirSync(SCHEMA_DIR, { recursive: true });
       const outFile = path.join(SCHEMA_DIR, `${domain}.json`);
       fs.writeFileSync(outFile, JSON.stringify(schema, null, 2));
-      console.error(`Schema saved to ${outFile}`);
+      console.error(`Schema saved to ${outFile} (${schema.totalCaptures} captures → ${schema.uniqueEndpoints} endpoints)`);
       console.log(JSON.stringify(schema, null, 2));
       break;
     }
