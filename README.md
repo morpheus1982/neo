@@ -87,6 +87,7 @@ node tools/neo.cjs open https://example.com
 │                                      │
 │  inject/interceptor.ts               │
 │    ├─ Monkey-patches fetch & XHR     │
+│    ├─ Intercepts WebSocket traffic   │
 │    ├─ Records full request/response  │
 │    └─ Correlates with DOM events     │
 │                                      │
@@ -101,11 +102,12 @@ node tools/neo.cjs open https://example.com
 └──────────────┬──────────────────────┘
                │ Chrome DevTools Protocol (port 9222)
 ┌──────────────┴──────────────────────┐
-│  CLI Tools (Node.js)                 │
-│  ├─ neo-query   → read captures      │
-│  ├─ neo-schema  → analyze → schema   │
-│  ├─ neo-exec    → execute in browser │
-│  └─ neo-web     → unified interface  │
+│  CLI: tools/neo.cjs (Node.js)        │
+│  ├─ neo capture → read/export data   │
+│  ├─ neo schema  → analyze → schema   │
+│  ├─ neo exec    → execute in browser │
+│  ├─ neo eval    → run JS in tab      │
+│  └─ neo read    → extract page text  │
 └──────────────┬──────────────────────┘
                │
 ┌──────────────┴──────────────────────┐
