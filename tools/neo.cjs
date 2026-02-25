@@ -1007,6 +1007,157 @@ commands.bridge = async function(args) {
   await new Promise(() => {});
 };
 
+// ─── Flow Analysis ──────────────────────────────────────────────
+
+commands.flows = async function(args) {
+  const domain = args[0];
+  if (!domain) {
+    console.log(`Usage: neo flows <domain> [--window <ms>] [--min-count <n>]
+    
+Analyze API call sequences to discover multi-step workflows.
+Groups temporally adjacent calls (within window) into "flows",
+then finds recurring patterns.
+
+Options:
+  --window <ms>     Max gap between calls in a flow (default: 2000)
+  --min-count <n>   Min occurrences to show a pattern (default: 2)`);
+    return;
+  }
+
+  const flags = {};
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--window' && args[i+1]) { flags.window = parseInt(args[i+1]); i++; }
+    if (args[i] === '--min-count' && args[i+1]) { flags.minCount = parseInt(args[i+1]); i++; }
+  }
+  const windowMs = flags.window || 2000;
+  const minCount = flags.minCount || 2;
+
+  const wsUrl = await findExtensionWs();
+
+  // Fetch all captures for domain, sorted by timestamp
+  const captures = await cdpEval(wsUrl, `
+    (async () => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open("${DB_NAME}");
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("${STORE_NAME}", "readonly");
+        const store = tx.objectStore("${STORE_NAME}");
+        const idx = store.index("domain");
+        const results = [];
+        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+          const cursor = e.target.result;
+          if (cursor) {
+            const v = cursor.value;
+            results.push({ method: v.method, url: v.url, timestamp: v.timestamp, status: v.responseStatus, trigger: v.trigger });
+            cursor.continue();
+          } else {
+            resolve(results);
+          }
+        };
+        tx.onerror = () => reject(tx.error);
+      });
+    })()
+  `, 60000);
+
+  if (!captures || captures.length === 0) {
+    console.error(`No captures for ${domain}`);
+    process.exit(1);
+  }
+
+  // Normalize URLs (remove query params, parameterize IDs)
+  function normalizeUrl(url) {
+    try {
+      const u = new URL(url);
+      let p = u.pathname;
+      // Parameterize: UUIDs, numeric IDs, hex hashes
+      p = p.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
+      p = p.replace(/\/\d{4,}\b/g, '/:id');
+      p = p.replace(/\/[0-9a-f]{24,}/gi, '/:hash');
+      return `${u.hostname}${p}`;
+    } catch { return url; }
+  }
+
+  // Sort by timestamp
+  captures.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Group into flows (sequences with gaps < windowMs)
+  const flows = [];
+  let currentFlow = [captures[0]];
+  for (let i = 1; i < captures.length; i++) {
+    if (captures[i].timestamp - captures[i-1].timestamp <= windowMs) {
+      currentFlow.push(captures[i]);
+    } else {
+      if (currentFlow.length >= 2) flows.push(currentFlow);
+      currentFlow = [captures[i]];
+    }
+  }
+  if (currentFlow.length >= 2) flows.push(currentFlow);
+
+  // Convert flows to normalized sequences
+  const sequenceMap = new Map(); // normalized key → { count, examples }
+  for (const flow of flows) {
+    const steps = flow.map(c => `${c.method} ${normalizeUrl(c.url)}`);
+    const key = steps.join(' → ');
+    if (!sequenceMap.has(key)) {
+      sequenceMap.set(key, { count: 0, steps, example: flow });
+    }
+    sequenceMap.get(key).count++;
+  }
+
+  // Filter by minCount and sort by frequency
+  const patterns = [...sequenceMap.values()]
+    .filter(p => p.count >= minCount)
+    .sort((a, b) => b.count - a.count);
+
+  if (patterns.length === 0) {
+    console.log(`No recurring flow patterns found for ${domain} (window: ${windowMs}ms, min: ${minCount}x)`);
+    console.log(`  Total captures: ${captures.length}, flows detected: ${flows.length}`);
+    return;
+  }
+
+  console.log(`Flow patterns for ${domain} (${patterns.length} patterns from ${flows.length} flows)\n`);
+  for (const p of patterns.slice(0, 20)) {
+    console.log(`  ${p.count}x  [${p.steps.length} steps]`);
+    for (const step of p.steps) {
+      console.log(`       ${step}`);
+    }
+    // Show trigger info from example if available
+    const triggers = p.example.filter(c => c.trigger);
+    if (triggers.length > 0) {
+      const t = triggers[0].trigger;
+      console.log(`       ← triggered by ${t.event}(${t.text || t.selector || '?'})`);
+    }
+    console.log();
+  }
+
+  // Also show "pair frequency" — which endpoints commonly co-occur
+  const pairCount = new Map();
+  for (const flow of flows) {
+    const endpoints = [...new Set(flow.map(c => `${c.method} ${normalizeUrl(c.url)}`))];
+    for (let i = 0; i < endpoints.length; i++) {
+      for (let j = i + 1; j < endpoints.length; j++) {
+        const pair = [endpoints[i], endpoints[j]].sort().join(' + ');
+        pairCount.set(pair, (pairCount.get(pair) || 0) + 1);
+      }
+    }
+  }
+
+  const topPairs = [...pairCount.entries()]
+    .filter(([, c]) => c >= minCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+
+  if (topPairs.length > 0) {
+    console.log(`Common API pairs:`);
+    for (const [pair, count] of topPairs) {
+      console.log(`  ${count}x  ${pair}`);
+    }
+  }
+};
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
@@ -1025,6 +1176,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo flows <domain> [--window ms]        Discover API call sequence patterns
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
 
 Options (for exec):
