@@ -48,27 +48,33 @@ Load the extension:
 
 ## CLI Tools
 
-All tools connect to Chrome via CDP (`localhost:9222`). Requires Chrome launched with `--remote-debugging-port=9222`.
+All commands go through a single CLI: `node tools/neo.cjs <command>`.
 
-### `neo-web` — Unified interface (recommended)
+Requires Chrome launched with `--remote-debugging-port=9222`.
+
+Single CLI, subcommand-style (inspired by [notion-cli](https://github.com/4ier/notion-cli)):
 
 ```bash
-node tools/neo-web.cjs status                      # Capture stats by domain
-node tools/neo-web.cjs read "github.com"            # Extract page content as text
-node tools/neo-web.cjs api <url> --tab-url x.com    # API call with auto-detected auth
-node tools/neo-web.cjs schema x.com                 # Generate API schema
-node tools/neo-web.cjs eval "document.title" --tab-url github.com
-node tools/neo-web.cjs open https://example.com     # Open URL in Chrome
-node tools/neo-web.cjs captures github.com 20       # List recent captures
+# Overview
+node tools/neo.cjs status
+
+# Captured traffic
+node tools/neo.cjs capture list github.com --limit 10
+node tools/neo.cjs capture domains
+node tools/neo.cjs capture export x.com > x-captures.json
+
+# API schema (auto-saves to local knowledge base)
+node tools/neo.cjs schema generate x.com
+node tools/neo.cjs schema show x.com
+
+# Execute API calls (auth headers auto-detected from captures)
+node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
+
+# Page interaction
+node tools/neo.cjs read github.com
+node tools/neo.cjs eval "document.title" --tab github.com
+node tools/neo.cjs open https://example.com
 ```
-
-### Individual tools
-
-| Tool | Purpose |
-|------|---------|
-| `neo-query.cjs` | Query captures: `count`, `domains`, `list [domain]`, `detail <id>`, `clear` |
-| `neo-schema.cjs` | Generate API schema for a domain from captured traffic |
-| `neo-exec.cjs` | Execute `fetch()` in browser context with `--auto-headers` and `--eval` |
 
 ## Architecture
 
