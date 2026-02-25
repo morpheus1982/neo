@@ -484,4 +484,195 @@ if (!window.__neoInterceptorInstalled) {
 
     return originalXHRsend.call(this, body as any);
   } as typeof originalXHRsend;
+
+  // ── WebSocket interception ──────────────────────────────────────────
+  const OriginalWebSocket = window.WebSocket;
+  const WS_META_KEY = '__neo_ws_meta';
+
+  // Per-connection message throttling
+  const WS_MSG_WINDOW_MS = 10_000; // 10 second window
+  const WS_MSG_MAX_PER_WINDOW = 20; // max messages captured per connection per window
+
+  interface WSMeta {
+    url: string;
+    domain: string;
+    connectedAt: number;
+    msgCount: number;
+    msgWindowStart: number;
+  }
+
+  function wsMessageToString(data: unknown): string {
+    if (typeof data === 'string') {
+      return truncateText(data);
+    }
+    if (data instanceof Blob) {
+      return `[Blob ${data.size} bytes]`;
+    }
+    if (data instanceof ArrayBuffer) {
+      return `[ArrayBuffer ${data.byteLength} bytes]`;
+    }
+    if (ArrayBuffer.isView(data)) {
+      return `[TypedArray ${data.byteLength} bytes]`;
+    }
+    return String(data);
+  }
+
+  function wsParseBody(raw: string): unknown {
+    if ((raw.startsWith('{') && raw.endsWith('}')) || (raw.startsWith('[') && raw.endsWith(']'))) {
+      try { return JSON.parse(raw); } catch { /* fall through */ }
+    }
+    return raw;
+  }
+
+  function shouldThrottleWsMsg(meta: WSMeta): boolean {
+    const now = Date.now();
+    if (now - meta.msgWindowStart > WS_MSG_WINDOW_MS) {
+      meta.msgCount = 0;
+      meta.msgWindowStart = now;
+    }
+    meta.msgCount++;
+    return meta.msgCount > WS_MSG_MAX_PER_WINDOW;
+  }
+
+  window.WebSocket = function NeoWebSocket(
+    this: WebSocket,
+    url: string | URL,
+    protocols?: string | string[]
+  ): WebSocket {
+    const ws: WebSocket = protocols !== undefined
+      ? new OriginalWebSocket(url, protocols)
+      : new OriginalWebSocket(url);
+
+    const wsUrl = typeof url === 'string' ? url : url.toString();
+    const meta: WSMeta = {
+      url: wsUrl,
+      domain: deriveDomain(wsUrl.replace(/^ws(s)?:\/\//, 'http$1://')),
+      connectedAt: Date.now(),
+      msgCount: 0,
+      msgWindowStart: Date.now(),
+    };
+
+    (ws as any)[WS_META_KEY] = meta;
+
+    // Capture connection open
+    ws.addEventListener('open', () => {
+      const payload: CapturedRequest = {
+        id: generateId(),
+        timestamp: Date.now(),
+        domain: meta.domain,
+        url: meta.url,
+        method: 'WS_OPEN',
+        requestHeaders: {},
+        requestBody: protocols ? { protocols: Array.isArray(protocols) ? protocols : [protocols] } : undefined,
+        responseStatus: 101,
+        responseHeaders: {},
+        responseBody: undefined,
+        duration: Date.now() - meta.connectedAt,
+        tabId: -1,
+        tabUrl: location.href,
+        source: 'websocket',
+      };
+      emitCapture(payload);
+    });
+
+    // Capture incoming messages
+    ws.addEventListener('message', (event: MessageEvent) => {
+      if (shouldThrottleWsMsg(meta)) return;
+      const raw = wsMessageToString(event.data);
+      const payload: CapturedRequest = {
+        id: generateId(),
+        timestamp: Date.now(),
+        domain: meta.domain,
+        url: meta.url,
+        method: 'WS_RECV',
+        requestHeaders: {},
+        requestBody: undefined,
+        responseStatus: 200,
+        responseHeaders: {},
+        responseBody: wsParseBody(raw),
+        duration: 0,
+        tabId: -1,
+        tabUrl: location.href,
+        source: 'websocket',
+      };
+      emitCapture(payload);
+    });
+
+    // Capture close
+    ws.addEventListener('close', (event: CloseEvent) => {
+      const payload: CapturedRequest = {
+        id: generateId(),
+        timestamp: Date.now(),
+        domain: meta.domain,
+        url: meta.url,
+        method: 'WS_CLOSE',
+        requestHeaders: {},
+        requestBody: undefined,
+        responseStatus: event.code,
+        responseHeaders: {},
+        responseBody: event.reason || undefined,
+        duration: Date.now() - meta.connectedAt,
+        tabId: -1,
+        tabUrl: location.href,
+        source: 'websocket',
+      };
+      emitCapture(payload);
+    });
+
+    // Capture errors
+    ws.addEventListener('error', () => {
+      const payload: CapturedRequest = {
+        id: generateId(),
+        timestamp: Date.now(),
+        domain: meta.domain,
+        url: meta.url,
+        method: 'WS_ERROR',
+        requestHeaders: {},
+        requestBody: undefined,
+        responseStatus: 0,
+        responseHeaders: {},
+        responseBody: '[WebSocket error]',
+        duration: Date.now() - meta.connectedAt,
+        tabId: -1,
+        tabUrl: location.href,
+        source: 'websocket',
+      };
+      emitCapture(payload);
+    });
+
+    // Intercept send() for outgoing messages
+    const originalWsSend = ws.send.bind(ws);
+    ws.send = function neoWsSend(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+      if (!shouldThrottleWsMsg(meta)) {
+        const raw = wsMessageToString(data);
+        const payload: CapturedRequest = {
+          id: generateId(),
+          timestamp: Date.now(),
+          domain: meta.domain,
+          url: meta.url,
+          method: 'WS_SEND',
+          requestHeaders: {},
+          requestBody: wsParseBody(raw),
+          responseStatus: 0,
+          responseHeaders: {},
+          responseBody: undefined,
+          duration: 0,
+          tabId: -1,
+          tabUrl: location.href,
+          source: 'websocket',
+        };
+        emitCapture(payload);
+      }
+      return originalWsSend(data);
+    };
+
+    return ws;
+  } as unknown as typeof WebSocket;
+
+  // Preserve static properties
+  window.WebSocket.prototype = OriginalWebSocket.prototype;
+  window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+  window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+  window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+  window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
 }
