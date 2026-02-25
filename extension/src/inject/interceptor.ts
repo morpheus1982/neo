@@ -4,6 +4,40 @@ import { normalizeCaptureValue } from '../db';
 const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map)(?:[?#].*)?$/i;
 const ANALYTICS_KEYWORDS = ['google-analytics', 'sentry', 'hotjar', 'mixpanel', 'segment'];
 
+// Dedup: track recent URL patterns to suppress high-frequency duplicates
+const recentCaptures = new Map<string, { count: number; lastTime: number }>();
+const DEDUP_WINDOW_MS = 60_000; // 1 minute window
+const DEDUP_MAX_PER_WINDOW = 3;  // Allow max 3 captures per URL pattern per window
+
+function getCaptureKey(method: string, url: string): string {
+  try {
+    const u = new URL(url, location.href);
+    return `${method} ${u.pathname}`;
+  } catch {
+    return `${method} ${url}`;
+  }
+}
+
+function shouldThrottle(method: string, url: string): boolean {
+  const key = getCaptureKey(method, url);
+  const now = Date.now();
+  const entry = recentCaptures.get(key);
+  
+  if (!entry || (now - entry.lastTime > DEDUP_WINDOW_MS)) {
+    recentCaptures.set(key, { count: 1, lastTime: now });
+    return false;
+  }
+  
+  entry.count++;
+  entry.lastTime = now;
+  
+  if (entry.count > DEDUP_MAX_PER_WINDOW) {
+    return true; // Throttle: too many of the same pattern
+  }
+  
+  return false;
+}
+
 declare global {
   interface Window {
     __neoInterceptorInstalled?: boolean;
@@ -230,6 +264,10 @@ if (!window.__neoInterceptorInstalled) {
   }
 
   function emitCapture(payload: CapturedRequest): void {
+    // Throttle high-frequency duplicate URLs
+    if (shouldThrottle(payload.method, payload.url)) {
+      return;
+    }
     try {
       window.postMessage({ type: NEO_CAPTURE_MESSAGE_TYPE, payload }, '*');
     } catch {
