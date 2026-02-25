@@ -924,7 +924,20 @@ commands.bridge = async function(args) {
   const quiet = args.includes('--quiet');
 
   const wss = new WebSocketServer({ port });
-  let clientCount = 0;
+  const clients = new Set();
+  const pendingResponses = new Map(); // id → { resolve, timer }
+  let cmdIdCounter = 0;
+
+  function sendCommand(cmd, cmdArgs) {
+    return new Promise((resolve, reject) => {
+      if (clients.size === 0) { reject(new Error('no extension connected')); return; }
+      const id = String(++cmdIdCounter);
+      const timer = setTimeout(() => { pendingResponses.delete(id); reject(new Error('timeout')); }, 10000);
+      pendingResponses.set(id, { resolve, timer });
+      const msg = JSON.stringify({ id, cmd, args: cmdArgs });
+      for (const c of clients) c.send(msg);
+    });
+  }
 
   if (!quiet) {
     process.stderr.write(`[Neo Bridge] listening on ws://127.0.0.1:${port}\n`);
@@ -932,8 +945,8 @@ commands.bridge = async function(args) {
   }
 
   wss.on('connection', (ws) => {
-    clientCount++;
-    if (!quiet) process.stderr.write(`[Neo Bridge] extension connected (${clientCount} client${clientCount > 1 ? 's' : ''})\n`);
+    clients.add(ws);
+    if (!quiet) process.stderr.write(`[Neo Bridge] extension connected (${clients.size} client${clients.size > 1 ? 's' : ''})\n`);
 
     ws.on('message', (raw) => {
       let msg;
@@ -948,29 +961,51 @@ commands.bridge = async function(args) {
           const status = c.status || '---';
           const src = c.source === 'websocket' ? ' [ws]' : c.source === 'eventsource' ? ' [sse]' : '';
           const dur = c.duration ? ` ${c.duration}ms` : '';
-          const trigger = c.trigger ? ` ← ${c.trigger.event}(${c.trigger.text || c.trigger.selector})` : '';
+          const trigger = c.trigger ? ` \u2190 ${c.trigger.event}(${c.trigger.text || c.trigger.selector})` : '';
           const ts = new Date(c.timestamp).toLocaleTimeString();
           process.stdout.write(`${ts} ${method} ${status} ${c.url}${src}${dur}${trigger}\n`);
         }
       } else if (msg.type === 'response') {
-        // Response to a command we sent
-        if (json) {
-          process.stdout.write(JSON.stringify({ type: 'response', ...msg.data }) + '\n');
+        const d = msg.data;
+        if (d && d.id && pendingResponses.has(d.id)) {
+          const { resolve, timer } = pendingResponses.get(d.id);
+          clearTimeout(timer);
+          pendingResponses.delete(d.id);
+          resolve(d);
         }
       }
     });
 
     ws.on('close', () => {
-      clientCount--;
-      if (!quiet) process.stderr.write(`[Neo Bridge] extension disconnected (${clientCount} client${clientCount > 1 ? 's' : ''})\n`);
+      clients.delete(ws);
+      if (!quiet) process.stderr.write(`[Neo Bridge] extension disconnected (${clients.size} client${clients.size > 1 ? 's' : ''})\n`);
     });
   });
+
+  // Interactive mode: read commands from stdin
+  if (process.stdin.isTTY || args.includes('--interactive')) {
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin });
+    if (!quiet) process.stderr.write('[Neo Bridge] interactive — commands: ping, status, capture.count, capture.list [domain] [limit]\n');
+    rl.on('line', async (line) => {
+      const parts = line.trim().split(/\s+/);
+      if (!parts[0]) return;
+      try {
+        const cmdArgs = {};
+        if (parts[1]) cmdArgs.domain = parts[1];
+        if (parts[2]) cmdArgs.limit = parseInt(parts[2]);
+        const resp = await sendCommand(parts[0], cmdArgs);
+        console.log(JSON.stringify(resp.result, null, 2));
+        if (resp.error) process.stderr.write(`Error: ${resp.error}\n`);
+      } catch (e) {
+        process.stderr.write(`Error: ${e.message}\n`);
+      }
+    });
+  }
 
   // Keep process alive
   await new Promise(() => {});
 };
-
-// ─── Main ───────────────────────────────────────────────────────
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
