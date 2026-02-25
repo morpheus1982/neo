@@ -25,6 +25,12 @@ function shouldThrottle(method: string, url: string): boolean {
   
   if (!entry || (now - entry.lastTime > DEDUP_WINDOW_MS)) {
     recentCaptures.set(key, { count: 1, lastTime: now });
+    // Periodic cleanup: evict stale entries when map grows large
+    if (recentCaptures.size > 200) {
+      for (const [k, v] of recentCaptures) {
+        if (now - v.lastTime > DEDUP_WINDOW_MS * 2) recentCaptures.delete(k);
+      }
+    }
     return false;
   }
   
@@ -142,27 +148,36 @@ if (!window.__neoInterceptorInstalled) {
     return normalized;
   }
 
-  async function normalizeRequestBody(value: unknown): Promise<unknown> {
-    if (value == null) {
-      return undefined;
-    }
-
-    if (typeof value === 'string') {
-      return truncateText(value);
-    }
-
-    if (value instanceof URLSearchParams) {
-      return truncateText(value.toString());
-    }
-
+  /**
+   * Normalize request/response body into a serializable form.
+   * When async=true (fetch), reads Blob contents. When sync (XHR), returns placeholder.
+   */
+  function normalizeBodySync(value: unknown): unknown {
+    if (value == null) return undefined;
+    if (typeof value === 'string') return truncateText(value);
+    if (value instanceof URLSearchParams) return truncateText(value.toString());
     if (value instanceof FormData) {
       const obj: Record<string, string> = {};
-      value.forEach((item, key) => {
-        obj[key] = String(item);
-      });
+      value.forEach((item, key) => { obj[key] = String(item); });
       return obj;
     }
+    if (value instanceof Blob) return `[Blob ${value.size} bytes]`;
+    if (value instanceof ArrayBuffer) {
+      try { return truncateText(new TextDecoder().decode(new Uint8Array(value))); }
+      catch { return '[arraybuffer body]'; }
+    }
+    if (ArrayBuffer.isView(value)) {
+      try { return truncateText(new TextDecoder().decode(value as ArrayBufferView)); }
+      catch { return '[typed array body]'; }
+    }
+    if (typeof value === 'object') {
+      try { return normalizeCaptureValue(value); }
+      catch { return '[unserializable body]'; }
+    }
+    return truncateText(String(value));
+  }
 
+  async function normalizeRequestBody(value: unknown): Promise<unknown> {
     if (value instanceof Blob) {
       try {
         const text = await value.text();
@@ -171,79 +186,7 @@ if (!window.__neoInterceptorInstalled) {
         return '[unreadable blob]';
       }
     }
-
-    if (value instanceof ArrayBuffer) {
-      const text = new TextDecoder().decode(new Uint8Array(value));
-      return truncateText(text);
-    }
-
-    if (ArrayBuffer.isView(value)) {
-      const text = new TextDecoder().decode(value as ArrayBufferView);
-      return truncateText(text);
-    }
-
-    if (typeof value === 'object') {
-      try {
-        const json = JSON.stringify(value);
-        return json ? truncateText(json) : '[object]';
-      } catch {
-        return '[unserializable body]';
-      }
-    }
-
-    return truncateText(String(value));
-  }
-
-  function normalizeXHRBody(value: unknown): unknown {
-    if (value == null) {
-      return undefined;
-    }
-
-    if (typeof value === 'string') {
-      return truncateText(value);
-    }
-
-    if (value instanceof URLSearchParams) {
-      return truncateText(value.toString());
-    }
-
-    if (value instanceof FormData) {
-      const obj: Record<string, string> = {};
-      value.forEach((item, key) => {
-        obj[key] = String(item);
-      });
-      return obj;
-    }
-
-    if (value instanceof Blob) {
-      return '[blob body]';
-    }
-
-    if (value instanceof ArrayBuffer) {
-      try {
-        return truncateText(new TextDecoder().decode(new Uint8Array(value)));
-      } catch {
-        return '[arraybuffer body]';
-      }
-    }
-
-    if (ArrayBuffer.isView(value)) {
-      try {
-        return truncateText(new TextDecoder().decode(value as ArrayBufferView));
-      } catch {
-        return '[view body]';
-      }
-    }
-
-    if (typeof value === 'object') {
-      try {
-        return normalizeCaptureValue(value);
-      } catch {
-        return '[object body]';
-      }
-    }
-
-    return truncateText(String(value));
+    return normalizeBodySync(value);
   }
 
   function parseResponseHeaders(raw: string): Record<string, string> {
@@ -434,7 +377,7 @@ if (!window.__neoInterceptorInstalled) {
       finished: false,
     } as XHRSnapshot);
 
-    requestMeta.body = normalizeXHRBody(body as unknown);
+    requestMeta.body = normalizeBodySync(body as unknown);
     requestMeta.startedAt = Date.now();
     requestMeta.startPerf = performance.now();
     requestMeta.skipped = shouldSkipRequest(requestMeta.url, requestMeta.headers);
