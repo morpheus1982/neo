@@ -9,7 +9,7 @@
 //   neo capture detail <id>                 Show full capture details
 //   neo capture stats <domain>              Domain statistics
 //   neo capture clear [domain]              Clear captures
-//   neo capture export [domain]             Export captures as JSON
+//   neo capture export [domain] [--format har] Export captures as JSON or HAR 1.2
 //   neo capture import <file>               Import captures from JSON file
 //   neo schema generate <domain> [--all]     Generate API schema from captures
 //   neo schema show <domain>                Show cached schema
@@ -277,6 +277,7 @@ commands.capture = async function(args) {
     case 'export': {
       const domain = positional[1];
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
+      const format = flags.format || 'json';
       const r = await cdpEval(wsUrl, dbEval(`
         var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
         store.openCursor().onsuccess = function(e) {
@@ -295,7 +296,60 @@ commands.capture = async function(args) {
       `), 60000);
       try {
         const parsed = JSON.parse(r);
-        console.log(JSON.stringify(parsed, null, 2));
+        if (format === 'har') {
+          // Convert to HAR 1.2 format (compatible with Postman, Charles, browser devtools)
+          const entries = parsed.map(cap => {
+            const reqHeaders = Object.entries(cap.requestHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+            const respHeaders = Object.entries(cap.responseHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+            const u = (() => { try { return new URL(cap.url); } catch { return null; } })();
+            const queryString = u ? [...u.searchParams].map(([n, v]) => ({ name: n, value: v })) : [];
+            const postData = cap.requestBody ? {
+              mimeType: (cap.requestHeaders || {})['content-type'] || 'application/json',
+              text: typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody)
+            } : undefined;
+            return {
+              startedDateTime: new Date(cap.timestamp).toISOString(),
+              time: cap.duration || 0,
+              request: {
+                method: cap.method,
+                url: cap.url,
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: reqHeaders,
+                queryString,
+                ...(postData ? { postData, bodySize: (postData.text || '').length } : { bodySize: 0 }),
+                headersSize: -1,
+              },
+              response: {
+                status: cap.responseStatus || 0,
+                statusText: '',
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: respHeaders,
+                content: {
+                  size: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody.length : JSON.stringify(cap.responseBody).length) : 0,
+                  mimeType: (cap.responseHeaders || {})['content-type'] || 'application/octet-stream',
+                  text: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody : JSON.stringify(cap.responseBody)) : '',
+                },
+                redirectURL: '',
+                headersSize: -1,
+                bodySize: -1,
+              },
+              cache: {},
+              timings: { send: 0, wait: cap.duration || 0, receive: 0 },
+            };
+          });
+          const har = {
+            log: {
+              version: '1.2',
+              creator: { name: 'Neo', version: '0.5.0' },
+              entries,
+            }
+          };
+          console.log(JSON.stringify(har, null, 2));
+        } else {
+          console.log(JSON.stringify(parsed, null, 2));
+        }
       } catch { console.log(r); }
       break;
     }
@@ -570,7 +624,7 @@ commands.capture = async function(args) {
   neo capture detail <id>                 Show full capture details
   neo capture search <query>              Search captures by URL (--method, --status, --limit)
   neo capture clear [domain]              Clear captures (all or by domain)
-  neo capture export [domain] [--since 1h] Export captures as JSON
+  neo capture export [domain] [--since 1h] [--format har] Export as JSON or HAR 1.2
   neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures
   neo capture summary                     Quick overview for AI agents
