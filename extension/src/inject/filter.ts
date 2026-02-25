@@ -18,6 +18,10 @@ const ANALYTICS_KEYWORDS = [
   // Media CDNs (not API calls)
   'video.twimg.com', 'abs.twimg.com', 'pbs.twimg.com',
   'googlevideo.com', 'ytimg.com',
+  // Bilibili CDNs
+  'hdslb.com', 'bilivideo.com', 'bilivideo.cn',
+  // LinkedIn tracking
+  'px.ads.linkedin.com',
 ];
 
 // Dedup state
