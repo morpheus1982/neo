@@ -1339,6 +1339,24 @@ Options:
   }
 };
 
+// neo reload — reload the Neo extension without toggling in chrome://extensions
+commands.reload = async function() {
+  const wsUrl = await findExtensionWs();
+  await cdpEval(wsUrl, `chrome.runtime.reload()`);
+  // Wait for the service worker to come back
+  console.log('Reloading extension...');
+  await new Promise(r => setTimeout(r, 2000));
+  try {
+    const newWs = await findExtensionWs();
+    const count = await cdpEval(newWs, dbEval(`
+      store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
+    `));
+    console.log(`Extension reloaded. ${count} captures intact.`);
+  } catch {
+    console.log('Extension reloaded (reconnecting may take a moment).');
+  }
+};
+
 // neo doctor — diagnose setup issues
 commands.doctor = async function() {
   const checks = [];
@@ -1418,6 +1436,7 @@ Commands:
   neo flows <domain> [--window ms]        Discover API call sequence patterns
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
   neo doctor                              Diagnose setup issues
+  neo reload                              Reload the Neo extension
 
 Options (for exec):
   --method GET|POST|PUT|DELETE            HTTP method (default: GET)
