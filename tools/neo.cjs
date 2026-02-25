@@ -1404,6 +1404,23 @@ Options:
   }
 };
 
+// neo tabs — list open Chrome tabs
+commands.tabs = async function(args) {
+  const { positional } = parseArgs(args || []);
+  const filter = positional[0];
+  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+  const pages = tabs.filter(t => t.type === 'page');
+  const filtered = filter ? pages.filter(t => t.url.includes(filter) || (t.title || '').toLowerCase().includes(filter.toLowerCase())) : pages;
+  if (!filtered.length) { console.log(filter ? `No tabs matching "${filter}"` : 'No tabs open'); return; }
+  for (const t of filtered) {
+    const title = (t.title || '').slice(0, 60);
+    const url = t.url.length > 80 ? t.url.slice(0, 77) + '...' : t.url;
+    console.log(`  ${title}`);
+    console.log(`    ${url}`);
+  }
+  console.log(`\n${filtered.length} tab(s)${filter ? ` matching "${filter}"` : ''}`);
+};
+
 // neo reload — reload the Neo extension without toggling in chrome://extensions
 commands.reload = async function() {
   const wsUrl = await findExtensionWs();
@@ -1497,6 +1514,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo tabs [filter]                       List open Chrome tabs
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
