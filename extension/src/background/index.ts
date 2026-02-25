@@ -3,6 +3,134 @@ import { isNeoCaptureMessage, NEO_CAPTURE_MESSAGE_TYPE, CapturedRequest } from '
 
 const tabCaptureCounts = new Map<number, number>();
 
+// ── Bridge WebSocket Client ─────────────────────────────────────
+const BRIDGE_URL = 'ws://127.0.0.1:9234';
+const BRIDGE_RECONNECT_MS = 5000;
+const BRIDGE_MAX_RECONNECT_MS = 60000;
+
+let bridgeWs: WebSocket | null = null;
+let bridgeReconnectDelay = BRIDGE_RECONNECT_MS;
+let bridgeReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let bridgeConnected = false;
+
+function bridgeConnect(): void {
+  if (bridgeWs && (bridgeWs.readyState === WebSocket.CONNECTING || bridgeWs.readyState === WebSocket.OPEN)) {
+    return;
+  }
+
+  try {
+    bridgeWs = new WebSocket(BRIDGE_URL);
+  } catch {
+    bridgeScheduleReconnect();
+    return;
+  }
+
+  bridgeWs.onopen = () => {
+    bridgeConnected = true;
+    bridgeReconnectDelay = BRIDGE_RECONNECT_MS;
+    console.log('[Neo Bridge] connected');
+  };
+
+  bridgeWs.onclose = () => {
+    bridgeConnected = false;
+    bridgeWs = null;
+    bridgeScheduleReconnect();
+  };
+
+  bridgeWs.onerror = () => {
+    // onclose will fire after this
+  };
+
+  bridgeWs.onmessage = (event) => {
+    void handleBridgeMessage(event.data as string);
+  };
+}
+
+function bridgeScheduleReconnect(): void {
+  if (bridgeReconnectTimer) return;
+  bridgeReconnectTimer = setTimeout(() => {
+    bridgeReconnectTimer = null;
+    bridgeConnect();
+  }, bridgeReconnectDelay);
+  bridgeReconnectDelay = Math.min(bridgeReconnectDelay * 1.5, BRIDGE_MAX_RECONNECT_MS);
+}
+
+function bridgeSend(type: string, data: unknown): void {
+  if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) return;
+  try {
+    bridgeWs.send(JSON.stringify({ type, data }));
+  } catch {
+    // ignore send errors
+  }
+}
+
+async function handleBridgeMessage(raw: string): Promise<void> {
+  let msg: { id?: string; cmd: string; args?: Record<string, unknown> };
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  const reply = (result: unknown, error?: string) => {
+    bridgeSend('response', { id: msg.id, result, error });
+  };
+
+  try {
+    switch (msg.cmd) {
+      case 'ping':
+        reply('pong');
+        break;
+      case 'status': {
+        const count = await db.capturedRequests.count();
+        const domains = new Map<string, number>();
+        await db.capturedRequests.each(c => {
+          domains.set(c.domain, (domains.get(c.domain) || 0) + 1);
+        });
+        reply({ count, domains: Object.fromEntries(domains) });
+        break;
+      }
+      case 'capture.count':
+        reply(await db.capturedRequests.count());
+        break;
+      case 'capture.list': {
+        const domain = msg.args?.domain as string | undefined;
+        const limit = (msg.args?.limit as number) || 50;
+        let collection = domain
+          ? db.capturedRequests.where('domain').equals(domain)
+          : db.capturedRequests.toCollection();
+        const items = await collection.reverse().limit(limit).toArray();
+        reply(items.map(c => ({
+          id: c.id,
+          method: c.method,
+          url: c.url,
+          status: c.responseStatus,
+          duration: c.duration,
+          source: c.source,
+          timestamp: c.timestamp,
+        })));
+        break;
+      }
+      case 'capture.detail': {
+        const id = msg.args?.id as string;
+        if (!id) { reply(null, 'missing id'); break; }
+        const item = await db.capturedRequests.get(id);
+        reply(item || null);
+        break;
+      }
+      default:
+        reply(null, `unknown command: ${msg.cmd}`);
+    }
+  } catch (err) {
+    reply(null, String(err));
+  }
+}
+
+// Start bridge connection
+bridgeConnect();
+
+// ── Message Listener ────────────────────────────────────────────
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (!isNeoCaptureMessage(message)) {
     return;
@@ -100,6 +228,20 @@ async function persistCapture(capture: CapturedRequest): Promise<void> {
     }
 
     await refreshBadge(capture.tabId);
+
+    // Stream to bridge in real-time
+    bridgeSend('capture', {
+      id: capture.id,
+      method: capture.method,
+      url: capture.url,
+      domain: capture.domain,
+      status: capture.responseStatus,
+      duration: capture.duration,
+      source: capture.source,
+      trigger: capture.trigger,
+      timestamp: capture.timestamp,
+      tabUrl: capture.tabUrl,
+    });
   } catch (err) {
     console.error('[Neo] persistCapture failed:', err);
   }

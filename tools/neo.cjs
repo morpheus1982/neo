@@ -18,6 +18,7 @@
 //   neo open <url>                          Open URL in Chrome
 //   neo replay <id> [--tab pattern]          Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
+//   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -914,6 +915,61 @@ commands.read = async function(args) {
   console.log(result);
 };
 
+// ─── Bridge Server ──────────────────────────────────────────────
+
+commands.bridge = async function(args) {
+  const { WebSocketServer } = require('ws');
+  const port = parseInt(args.find(a => /^\d+$/.test(a)) || '9234', 10);
+  const json = args.includes('--json');
+  const quiet = args.includes('--quiet');
+
+  const wss = new WebSocketServer({ port });
+  let clientCount = 0;
+
+  if (!quiet) {
+    process.stderr.write(`[Neo Bridge] listening on ws://127.0.0.1:${port}\n`);
+    process.stderr.write(`[Neo Bridge] waiting for extension to connect...\n`);
+  }
+
+  wss.on('connection', (ws) => {
+    clientCount++;
+    if (!quiet) process.stderr.write(`[Neo Bridge] extension connected (${clientCount} client${clientCount > 1 ? 's' : ''})\n`);
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+      if (msg.type === 'capture') {
+        const c = msg.data;
+        if (json) {
+          process.stdout.write(JSON.stringify(c) + '\n');
+        } else {
+          const method = (c.method || '???').padEnd(6);
+          const status = c.status || '---';
+          const src = c.source === 'websocket' ? ' [ws]' : c.source === 'eventsource' ? ' [sse]' : '';
+          const dur = c.duration ? ` ${c.duration}ms` : '';
+          const trigger = c.trigger ? ` ← ${c.trigger.event}(${c.trigger.text || c.trigger.selector})` : '';
+          const ts = new Date(c.timestamp).toLocaleTimeString();
+          process.stdout.write(`${ts} ${method} ${status} ${c.url}${src}${dur}${trigger}\n`);
+        }
+      } else if (msg.type === 'response') {
+        // Response to a command we sent
+        if (json) {
+          process.stdout.write(JSON.stringify({ type: 'response', ...msg.data }) + '\n');
+        }
+      }
+    });
+
+    ws.on('close', () => {
+      clientCount--;
+      if (!quiet) process.stderr.write(`[Neo Bridge] extension disconnected (${clientCount} client${clientCount > 1 ? 's' : ''})\n`);
+    });
+  });
+
+  // Keep process alive
+  await new Promise(() => {});
+};
+
 // ─── Main ───────────────────────────────────────────────────────
 
 async function main() {
@@ -934,6 +990,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
 
 Options (for exec):
   --method GET|POST|PUT|DELETE            HTTP method (default: GET)
