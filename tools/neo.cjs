@@ -1007,6 +1007,140 @@ commands.bridge = async function(args) {
   await new Promise(() => {});
 };
 
+// ─── Smart API Call ─────────────────────────────────────────────
+
+commands.api = async function(args) {
+  const { positional, flags } = parseArgs(args);
+  const domain = positional[0];
+  const query = positional.slice(1).join(' ');
+
+  if (!domain || !query) {
+    console.log(`Usage: neo api <domain> <search-term> [--body '{}'] [--method POST]
+
+Search schema for a matching endpoint and execute it with auto-detected auth.
+
+Examples:
+  neo api x.com CreateTweet --body '{"variables":{"tweet_text":"hello"}}'
+  neo api github.com notifications
+  neo api x.com HomeTimeline`);
+    return;
+  }
+
+  // Load schema
+  const schemaFile = path.join(SCHEMA_DIR, `${domain}.json`);
+  if (!fs.existsSync(schemaFile)) {
+    console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+    process.exit(1);
+  }
+  const schema = JSON.parse(fs.readFileSync(schemaFile, 'utf8'));
+
+  // Search endpoints by name/path
+  const queryLower = query.toLowerCase();
+  const matches = schema.endpoints.filter(ep => {
+    const path = (ep.pathPattern || ep.path || '').toLowerCase();
+    return path.includes(queryLower);
+  });
+
+  if (matches.length === 0) {
+    console.error(`No endpoint matching "${query}" in ${domain} schema`);
+    console.error('Available endpoints:');
+    for (const ep of schema.endpoints.slice(0, 15)) {
+      console.error(`  ${ep.method} ${ep.pathPattern || ep.path}`);
+    }
+    process.exit(1);
+  }
+
+  // Use first match (or exact match if available)
+  const exact = matches.find(ep => (ep.pathPattern || ep.path || '').toLowerCase().endsWith(queryLower.toLowerCase()));
+  const endpoint = exact || matches[0];
+
+  if (matches.length > 1) {
+    console.error(`Found ${matches.length} matches, using: ${endpoint.method} ${endpoint.pathPattern || endpoint.path}`);
+    if (matches.length <= 5) {
+      for (const m of matches) {
+        const mark = m === endpoint ? '  →' : '   ';
+        console.error(`${mark} ${m.method} ${m.pathPattern || m.path}`);
+      }
+    }
+  }
+
+  // Build URL — need an actual capture to get the real URL with hash
+  const wsUrl = await findExtensionWs();
+  const pathPattern = endpoint.pathPattern || endpoint.path;
+
+  // Find a recent capture matching this endpoint pattern
+  const captureUrl = await cdpEval(wsUrl, `
+    (async () => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open("${DB_NAME}");
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      return new Promise((resolve) => {
+        const tx = db.transaction("${STORE_NAME}", "readonly");
+        const store = tx.objectStore("${STORE_NAME}");
+        const idx = store.index("domain");
+        let found = null;
+        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)}), "prev").onsuccess = function(e) {
+          const cursor = e.target.result;
+          if (cursor) {
+            const v = cursor.value;
+            const url = new URL(v.url);
+            const normalized = url.pathname
+              .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
+              .replace(/\\/\\d{4,}\\b/g, '/:id')
+              .replace(/\\/[0-9a-f]{24,}/gi, '/:hash');
+            // Check hash parameterization for GraphQL
+            const segments = url.pathname.split('/');
+            let parameterized = normalized;
+            for (const seg of segments) {
+              if (seg.length >= 10) {
+                let switches = 0;
+                for (let i = 1; i < seg.length; i++) {
+                  const prevIsDigit = /\\d/.test(seg[i-1]);
+                  const currIsDigit = /\\d/.test(seg[i]);
+                  if (prevIsDigit !== currIsDigit) switches++;
+                }
+                if (switches >= 3) parameterized = parameterized.replace(seg, ':hash');
+              }
+            }
+            if (v.method === ${JSON.stringify(endpoint.method)} && parameterized.toLowerCase().includes(${JSON.stringify(queryLower)})) {
+              found = v.url;
+              resolve(found);
+              return;
+            }
+            cursor.continue();
+          } else {
+            resolve(found);
+          }
+        };
+      });
+    })()
+  `, 30000);
+
+  if (!captureUrl) {
+    console.error(`No capture found matching ${endpoint.method} ...${query}. Cannot reconstruct full URL.`);
+    console.error(`Try: neo exec <full-url> --auto-headers`);
+    process.exit(1);
+  }
+
+  console.error(`Matched: ${endpoint.method} ${captureUrl.slice(0, 100)}${captureUrl.length > 100 ? '...' : ''}`);
+
+  // Delegate to exec with auto-headers, auto-detect tab from domain
+  const execArgs = [captureUrl, '--method', flags.method || endpoint.method, '--auto-headers'];
+  if (flags.body) execArgs.push('--body', flags.body);
+  execArgs.push('--tab', flags.tab || domain);
+
+  // Rewrite process.argv for exec's rawArgs parsing
+  const savedArgv = process.argv;
+  process.argv = ['node', 'neo', 'exec', ...execArgs];
+  try {
+    await commands.exec(execArgs);
+  } finally {
+    process.argv = savedArgv;
+  }
+};
+
 // ─── Flow Analysis ──────────────────────────────────────────────
 
 commands.flows = async function(args) {
@@ -1176,6 +1310,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
 
