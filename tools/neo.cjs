@@ -7,6 +7,7 @@
 //   neo capture count                       Total capture count
 //   neo capture domains                     List domains with counts
 //   neo capture detail <id>                 Show full capture details
+//   neo capture stats <domain>              Domain statistics
 //   neo capture clear [domain]              Clear captures
 //   neo capture export [domain]             Export captures as JSON
 //   neo schema generate <domain>            Generate API schema from captures
@@ -260,6 +261,41 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'stats': {
+      const domain = positional[1];
+      if (!domain) { console.error('Usage: neo capture stats <domain>'); process.exit(1); }
+      const r = await cdpEval(wsUrl, dbEval(`
+        var stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
+        var domain = ${JSON.stringify(domain)};
+        store.openCursor().onsuccess = function(e) {
+          var c = e.target.result;
+          if (c) {
+            var v = c.value;
+            if (v.domain === domain) {
+              stats.total++;
+              stats.methods[v.method] = (stats.methods[v.method] || 0) + 1;
+              stats.statuses[v.responseStatus] = (stats.statuses[v.responseStatus] || 0) + 1;
+              stats.sources[v.source || 'fetch'] = (stats.sources[v.source || 'fetch'] || 0) + 1;
+              stats.totalDuration += (v.duration || 0);
+              if (v.responseStatus >= 400 || v.responseStatus === 0) stats.errors++;
+            }
+            c.continue();
+          } else {
+            resolve(JSON.stringify(stats));
+          }
+        };
+      `));
+      const stats = JSON.parse(r);
+      if (!stats.total) { console.log(`No captures for ${domain}`); break; }
+      console.log(`${domain} — ${stats.total} captures\n`);
+      console.log(`Methods:  ${Object.entries(stats.methods).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
+      console.log(`Statuses: ${Object.entries(stats.statuses).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
+      console.log(`Sources:  ${Object.entries(stats.sources).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
+      console.log(`Avg duration: ${Math.round(stats.totalDuration / stats.total)}ms`);
+      console.log(`Error rate: ${(stats.errors / stats.total * 100).toFixed(1)}%`);
+      break;
+    }
+
     case 'watch': {
       const domain = positional[1];
       console.error(`Watching captures${domain ? ' for ' + domain : ''}... (Ctrl+C to stop)`);
@@ -304,6 +340,7 @@ commands.capture = async function(args) {
   neo capture list [domain] [--limit N]   List recent captures
   neo capture count                       Total capture count
   neo capture domains                     List domains with counts
+  neo capture stats <domain>              Domain statistics (methods, errors, timing)
   neo capture detail <id>                 Show full capture details
   neo capture clear [domain]              Clear captures (all or by domain)
   neo capture export [domain]             Export captures as JSON
