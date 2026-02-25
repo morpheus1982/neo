@@ -759,7 +759,18 @@ commands.schema = async function(args) {
                     responseBodyStructure: ep.responseKeys || undefined,
                     triggers: Object.keys(ep.triggers).length
                       ? Object.values(ep.triggers).sort(function(a,b){ return b.count - a.count; }).slice(0, 5)
-                      : undefined
+                      : undefined,
+                    category: (function() {
+                      var m = ep.method;
+                      var p = ep.path.toLowerCase();
+                      if (m.startsWith('WS_') || m.startsWith('SSE_')) return 'realtime';
+                      if (p.includes('auth') || p.includes('login') || p.includes('token') || p.includes('oauth') || p.includes('session')) return 'auth';
+                      if (p.includes('search') || p.includes('query')) return 'search';
+                      if (p.includes('/log_') || p.includes('/log/') || p.endsWith('/log') || p.includes('track') || p.includes('/event') || p.includes('beacon') || p.includes('metric') || p.includes('telemetry')) return 'telemetry';
+                      if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'read';
+                      if (m === 'POST' || m === 'PUT' || m === 'PATCH' || m === 'DELETE') return 'write';
+                      return undefined;
+                    })()
                   };
                 })
               };
@@ -828,7 +839,8 @@ commands.schema = async function(args) {
             ? Object.entries(ep.bodyFieldVariability).filter(([,v]) => v === 'variable').map(([k]) => k)
             : [];
           const varNote = variability.length ? ` [varies: ${variability.join(', ')}]` : '';
-          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}${varNote}`);
+          const cat = ep.category ? ` (${ep.category})` : '';
+          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}${varNote}${cat}`);
           if (ep.triggers?.length) {
             for (const t of ep.triggers) {
               console.log(`    ← ${t.event} ${t.selector}${t.text ? ' "' + t.text + '"' : ''} (${t.count}x)`);
