@@ -30,8 +30,9 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 
 async function findExtensionWs() {
   const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
-  const sw = tabs.find(t => t.url.includes(NEO_EXTENSION_ID));
-  if (!sw) throw new Error('Neo extension service worker not found. Is it installed and active?');
+  // Must match the service_worker, not the extensions page
+  const sw = tabs.find(t => t.type === 'service_worker' && t.url.includes(NEO_EXTENSION_ID));
+  if (!sw) throw new Error('Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222');
   return sw.webSocketDebuggerUrl;
 }
 
