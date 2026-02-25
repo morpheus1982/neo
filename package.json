@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "vite build"
+    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build && NEO_ENTRY=popup vite build"
   },
   "dependencies": {
     "dexie": "^4.0.11"

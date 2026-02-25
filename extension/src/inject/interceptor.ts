@@ -242,7 +242,7 @@ if (!window.__neoInterceptorInstalled) {
     const input = args[0];
     const startedAt = Date.now();
     const startPerf = performance.now();
-    const url = toAbsoluteUrl(input as string | URL);
+    const url = toAbsoluteUrl(input instanceof Request ? input.url : (input as string | URL));
     const method = ((typeof input !== 'string' && !(input instanceof URL) && init?.method)
       ? init.method
       : (input instanceof Request ? input.method : (init?.method || 'GET'))
