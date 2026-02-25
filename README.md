@@ -61,11 +61,14 @@ node tools/neo.cjs status
 # Captured traffic
 node tools/neo.cjs capture list github.com --limit 10
 node tools/neo.cjs capture domains
+node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
 node tools/neo.cjs capture export x.com > x-captures.json
 
 # API schema (auto-saves to local knowledge base)
-node tools/neo.cjs schema generate x.com
-node tools/neo.cjs schema show x.com
+node tools/neo.cjs schema list                   # List all known schemas
+node tools/neo.cjs schema generate x.com         # Generate from captures
+node tools/neo.cjs schema show x.com             # Human-readable summary
+node tools/neo.cjs schema show x.com --json      # Raw JSON
 
 # Execute API calls (auth headers auto-detected from captures)
 node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
@@ -136,7 +139,7 @@ The interceptor ignores noise automatically:
 - Static assets (images, fonts, CSS, JS bundles)
 - Analytics/tracking (Google Analytics, Meta Pixel, Sentry, etc.)
 - Browser internals (chrome-extension://, data:, blob:)
-- Duplicate requests within 100ms window
+- **Rate limiting**: Max 3 captures per URL pattern per minute (prevents polling endpoint bloat)
 
 ## Tech Stack
 
@@ -149,9 +152,10 @@ The interceptor ignores noise automatically:
 ## Roadmap
 
 - [x] Extension: capture + store + popup viewer
-- [x] CLI tools: query, schema, execute, unified interface
-- [x] Storage management: per-domain caps, auto-cleanup
-- [ ] Incremental schema updates, export/import
+- [x] CLI tools: unified `neo` CLI with subcommands
+- [x] Storage management: per-domain caps, auto-cleanup, rate limiting
+- [x] Schema: browser-side analysis, URL normalization, body structure extraction
+- [x] Smart filtering: static assets, analytics, duplicate suppression
 - [ ] Dual-channel: Neo API-first → browser-use fallback
 - [ ] Multi-step workflow replay
 
