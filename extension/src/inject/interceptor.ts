@@ -2,7 +2,14 @@ import { CapturedRequest, MAX_CAPTURE_BODY_BYTES, NEO_CAPTURE_MESSAGE_TYPE } fro
 import { normalizeCaptureValue } from '../utils';
 
 const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map)(?:[?#].*)?$/i;
-const ANALYTICS_KEYWORDS = ['google-analytics', 'sentry', 'hotjar', 'mixpanel', 'segment'];
+const ANALYTICS_KEYWORDS = [
+  'google-analytics', 'googletagmanager', 'googlesyndication', 'doubleclick',
+  'sentry.io', 'hotjar.com', 'mixpanel.com', 'segment.com', 'segment.io',
+  'amplitude.com', 'fullstory.com', 'intercom.io', 'crisp.chat',
+  'hubspot.com', 'clarity.ms', 'newrelic.com', 'datadoghq.com',
+  'bugsnag.com', 'logrocket.io', 'heapanalytics.com', 'posthog.com',
+  'connect.facebook.net', 'bat.bing.com', 'mc.yandex.ru',
+];
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
 const recentCaptures = new Map<string, { count: number; lastTime: number }>();
@@ -142,7 +149,7 @@ if (!window.__neoInterceptorInstalled) {
       const pathname = parsed.pathname.toLowerCase();
       const hostname = parsed.hostname.toLowerCase();
 
-      if (['chrome-extension:', 'moz-extension:', 'safari-extension:'].includes(parsed.protocol)) {
+      if (['chrome-extension:', 'moz-extension:', 'safari-extension:', 'data:', 'blob:'].includes(parsed.protocol)) {
         return true;
       }
 
