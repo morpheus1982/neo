@@ -28,7 +28,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - 对比 browser-use：在 API 层操作，快一个数量级，不受 UI 改版影响。
 - 一句话：**装个插件，用几天，AI 就学会了你用的所有工具。**
 
-## 当前状态 (v0.3.0)
+## 当前状态 (v0.4.0)
 
 ### ✅ 已完成
 
@@ -73,13 +73,20 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 **OpenClaw Skill**
 - `~/clawd/skills/neo/SKILL.md` — AI 可直接使用 Neo 工具链
 
+**WebSocket Bridge**
+- Extension auto-connects to `ws://127.0.0.1:9234` with exponential backoff reconnection
+- Real-time capture streaming (summary per capture event)
+- Bidirectional command channel: ping, status, capture.count/list/domains/detail/search/clear
+- CLI: `neo bridge [port] [--json] [--quiet] [--interactive]`
+- NDJSON output mode for piping into other tools
+
 **已生成 Schema**
 - GitHub (17 endpoints), YouTube (14), Reddit (18), X/Twitter (GraphQL), Linear (1), Notion (2)
 
 ### 🔲 待做
 
 **近期**
-- [ ] WebSocket Bridge — 实时推送捕获数据到 OpenClaw（当前靠 CLI 轮询）
+- [x] WebSocket Bridge — 实时推送捕获数据，双向命令通道（`neo bridge`）
 - [ ] Schema 增量更新 — 避免大数据量重新分析
 - [ ] 更多网站实战测试和 schema 积累
 - [ ] `neo capture export` 格式标准化（跨设备迁移）
