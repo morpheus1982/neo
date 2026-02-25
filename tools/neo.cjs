@@ -992,6 +992,39 @@ commands.schema = async function(args) {
       break;
     }
 
+    case 'coverage': {
+      // Show which domains have schemas vs just captures
+      const wsUrl = await findExtensionWs();
+      const domainsJson = await cdpEval(wsUrl, dbEval(`
+        var domains = {};
+        store.openCursor().onsuccess = function(e) {
+          var c = e.target.result;
+          if (c) { var d = c.value.domain; domains[d] = (domains[d] || 0) + 1; c.continue(); }
+          else { resolve(JSON.stringify(domains)); }
+        };
+      `), 15000);
+      const domainCounts = JSON.parse(domainsJson || '{}');
+      const schemaFiles = fs.existsSync(SCHEMA_DIR)
+        ? new Set(fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', '')))
+        : new Set();
+      
+      const entries = Object.entries(domainCounts).sort((a, b) => b[1] - a[1]);
+      console.log(`Schema coverage: ${schemaFiles.size} schemas / ${entries.length} domains with captures\n`);
+      for (const [domain, count] of entries) {
+        const hasSchema = schemaFiles.has(domain);
+        const icon = hasSchema ? '✓' : '○';
+        let detail = '';
+        if (hasSchema) {
+          try {
+            const s = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, `${domain}.json`), 'utf8'));
+            detail = ` → ${s.uniqueEndpoints} endpoints`;
+          } catch {}
+        }
+        console.log(`  ${icon} ${domain} (${count} captures)${detail}`);
+      }
+      break;
+    }
+
     case 'openapi': {
       // Convert Neo schema to OpenAPI 3.0 spec
       const domain = positional[1];
@@ -1118,6 +1151,7 @@ commands.schema = async function(args) {
   neo schema generate <domain>    Generate schema from captures (--all for all domains)
   neo schema show <domain>        Show cached schema (--json for raw)
   neo schema search <query>       Search all schemas for matching endpoints
+  neo schema coverage             Show which domains have schemas vs just captures
   neo schema openapi <domain>     Export as OpenAPI 3.0 spec`);
   }
 };
