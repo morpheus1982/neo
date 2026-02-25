@@ -382,7 +382,8 @@ commands.schema = async function(args) {
                     method: v.method, path: normalizePath(u.pathname),
                     queryParams: {}, statusCodes: {},
                     headers: {}, durations: [], count: 0, responseType: null,
-                    bodyKeys: null
+                    bodyKeys: null,
+                    responseKeys: null
                   };
                 }
                 var ep = endpoints[key];
@@ -400,6 +401,17 @@ commands.schema = async function(args) {
                       ep.bodyKeys = extractKeys(bodyObj, 2);
                     }
                   } catch(ex2) {}
+                }
+                
+                // Extract response body structure (first successful response)
+                if (!ep.responseKeys && v.responseStatus >= 200 && v.responseStatus < 300 && v.responseBody) {
+                  try {
+                    var respStr = typeof v.responseBody === 'string' ? v.responseBody : JSON.stringify(v.responseBody);
+                    var respObj = JSON.parse(respStr);
+                    if (respObj && typeof respObj === 'object') {
+                      ep.responseKeys = extractKeys(respObj, 2);
+                    }
+                  } catch(ex3) {}
                 }
                 var rh = v.requestHeaders || {};
                 for (var hk in rh) {
@@ -435,7 +447,8 @@ commands.schema = async function(args) {
                       ? Object.keys(ep.headers)  // Only store header NAMES, not values
                       : undefined,
                     responseType: ep.responseType,
-                    requestBodyStructure: ep.bodyKeys || undefined
+                    requestBodyStructure: ep.bodyKeys || undefined,
+                    responseBodyStructure: ep.responseKeys || undefined
                   };
                 })
               };
