@@ -653,6 +653,7 @@ commands.schema = async function(args) {
                     queryParams: {}, statusCodes: {},
                     headers: {}, durations: [], count: 0, responseType: null,
                     bodyKeys: null,
+                    bodySamples: [],
                     responseKeys: null,
                     triggers: {},
                     sources: {}
@@ -665,13 +666,24 @@ commands.schema = async function(args) {
                 ep.statusCodes[v.responseStatus] = (ep.statusCodes[v.responseStatus] || 0) + 1;
                 if (v.duration) ep.durations.push(v.duration);
                 
-                // Extract request body structure (keys only, first occurrence)
-                if (!ep.bodyKeys && v.requestBody) {
+                // Extract request body structure (collect up to 5 samples for variability analysis)
+                if (v.requestBody && ep.bodySamples.length < 5) {
                   try {
                     var bodyStr = typeof v.requestBody === 'string' ? v.requestBody : JSON.stringify(v.requestBody);
                     var bodyObj = JSON.parse(bodyStr);
-                    if (bodyObj && typeof bodyObj === 'object') {
-                      ep.bodyKeys = extractKeys(bodyObj, 2);
+                    if (bodyObj && typeof bodyObj === 'object' && !Array.isArray(bodyObj)) {
+                      if (!ep.bodyKeys) ep.bodyKeys = extractKeys(bodyObj, 2);
+                      // Store top-level key→value pairs for variability detection
+                      var sample = {};
+                      for (var bk in bodyObj) {
+                        if (bodyObj.hasOwnProperty(bk)) {
+                          var bv = bodyObj[bk];
+                          sample[bk] = (bv === null || bv === undefined) ? null
+                            : (typeof bv === 'object') ? JSON.stringify(bv)
+                            : String(bv);
+                        }
+                      }
+                      ep.bodySamples.push(sample);
                     }
                   } catch(ex2) {}
                 }
@@ -730,6 +742,18 @@ commands.schema = async function(args) {
                     responseType: ep.responseType,
                     source: Object.keys(ep.sources).length === 1 ? Object.keys(ep.sources)[0] : ep.sources,
                     requestBodyStructure: ep.bodyKeys || undefined,
+                    bodyFieldVariability: (function() {
+                      if (ep.bodySamples.length < 2) return undefined;
+                      var allKeys = {};
+                      ep.bodySamples.forEach(function(s) { for (var k in s) allKeys[k] = true; });
+                      var result = {};
+                      for (var k in allKeys) {
+                        var vals = new Set();
+                        ep.bodySamples.forEach(function(s) { if (s[k] !== undefined) vals.add(s[k]); });
+                        result[k] = vals.size <= 1 ? 'constant' : 'variable';
+                      }
+                      return Object.keys(result).length ? result : undefined;
+                    })(),
                     responseBodyStructure: ep.responseKeys || undefined,
                     triggers: Object.keys(ep.triggers).length
                       ? Object.values(ep.triggers).sort(function(a,b){ return b.count - a.count; }).slice(0, 5)
@@ -798,7 +822,11 @@ commands.schema = async function(args) {
           const auth = ep.authHeaders?.length ? ` [auth: ${ep.authHeaders.join(', ')}]` : '';
           const params = ep.queryParams?.length ? ` ?${ep.queryParams.join('&')}` : '';
           const body = ep.requestBodyStructure ? ` body:{${Object.keys(ep.requestBodyStructure).join(', ')}}` : '';
-          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}`);
+          const variability = ep.bodyFieldVariability
+            ? Object.entries(ep.bodyFieldVariability).filter(([,v]) => v === 'variable').map(([k]) => k)
+            : [];
+          const varNote = variability.length ? ` [varies: ${variability.join(', ')}]` : '';
+          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}${varNote}`);
           if (ep.triggers?.length) {
             for (const t of ep.triggers) {
               console.log(`    ← ${t.event} ${t.selector}${t.text ? ' "' + t.text + '"' : ''} (${t.count}x)`);
