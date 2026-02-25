@@ -118,6 +118,41 @@ async function handleBridgeMessage(raw: string): Promise<void> {
         reply(item || null);
         break;
       }
+      case 'capture.domains': {
+        const domains = new Map<string, number>();
+        await db.capturedRequests.each(c => {
+          domains.set(c.domain, (domains.get(c.domain) || 0) + 1);
+        });
+        const sorted = [...domains.entries()].sort((a, b) => b[1] - a[1]);
+        reply(sorted.map(([d, c]) => ({ domain: d, count: c })));
+        break;
+      }
+      case 'capture.clear': {
+        const domain = msg.args?.domain as string | undefined;
+        if (domain) {
+          const ids = await db.capturedRequests.where('domain').equals(domain).primaryKeys();
+          await db.capturedRequests.bulkDelete(ids);
+          reply({ cleared: ids.length, domain });
+        } else {
+          await db.capturedRequests.clear();
+          reply({ cleared: 'all' });
+        }
+        break;
+      }
+      case 'capture.search': {
+        const query = (msg.args?.query as string || '').toLowerCase();
+        const method = msg.args?.method as string | undefined;
+        const limit = (msg.args?.limit as number) || 20;
+        const results: Array<{ id: string; method: string; url: string; status: number; timestamp: number }> = [];
+        await db.capturedRequests.reverse().each(c => {
+          if (results.length >= limit) return;
+          if (query && !c.url.toLowerCase().includes(query)) return;
+          if (method && c.method.toUpperCase() !== method.toUpperCase()) return;
+          results.push({ id: c.id, method: c.method, url: c.url, status: c.responseStatus, timestamp: c.timestamp });
+        });
+        reply(results);
+        break;
+      }
       default:
         reply(null, `unknown command: ${msg.cmd}`);
     }
