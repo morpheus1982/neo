@@ -41,23 +41,27 @@ chrome.runtime.onStartup.addListener(() => {
 void hydrateCounts();
 
 async function hydrateCounts(): Promise<void> {
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    if (typeof tab.id !== 'number') {
-      continue;
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (typeof tab.id !== 'number') {
+        continue;
+      }
+
+      const count = await db.capturedRequests
+        .where('tabId')
+        .equals(tab.id)
+        .count();
+
+      if (count > 0) {
+        tabCaptureCounts.set(tab.id, count);
+      }
     }
 
-    const count = await db.capturedRequests
-      .where('tabId')
-      .equals(tab.id)
-      .count();
-
-    if (count > 0) {
-      tabCaptureCounts.set(tab.id, count);
-    }
+    await refreshBadge();
+  } catch (err) {
+    console.error('[Neo] hydrateCounts failed:', err);
   }
-
-  await refreshBadge();
 }
 
 async function refreshBadge(tabId?: number): Promise<void> {
@@ -87,14 +91,18 @@ async function getActiveTabId(): Promise<number | undefined> {
 }
 
 async function persistCapture(capture: CapturedRequest): Promise<void> {
-  await addCapture(capture);
+  try {
+    await addCapture(capture);
 
-  if (capture.tabId > -1) {
-    const existing = tabCaptureCounts.get(capture.tabId) || 0;
-    tabCaptureCounts.set(capture.tabId, existing + 1);
+    if (capture.tabId > -1) {
+      const existing = tabCaptureCounts.get(capture.tabId) || 0;
+      tabCaptureCounts.set(capture.tabId, existing + 1);
+    }
+
+    await refreshBadge(capture.tabId);
+  } catch (err) {
+    console.error('[Neo] persistCapture failed:', err);
   }
-
-  await refreshBadge(capture.tabId);
 }
 
 console.log(NEO_CAPTURE_MESSAGE_TYPE);
