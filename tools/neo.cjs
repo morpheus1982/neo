@@ -1869,6 +1869,92 @@ Options:
   }
 };
 
+// neo suggest — suggest actions based on captured schema
+commands.suggest = async function(args) {
+  const { positional } = parseArgs(args || []);
+  const domain = positional[0];
+  if (!domain) {
+    console.log(`Usage: neo suggest <domain>
+
+Analyze a domain's schema and suggest what an AI agent can do with it.
+Groups endpoints by category and suggests high-level capabilities.`);
+    return;
+  }
+
+  const schemaFile = path.join(SCHEMA_DIR, `${domain}.json`);
+  if (!fs.existsSync(schemaFile)) {
+    console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+    process.exit(1);
+  }
+
+  const schema = JSON.parse(fs.readFileSync(schemaFile, 'utf8'));
+  const endpoints = schema.endpoints || [];
+
+  // Group by category
+  const categories = {};
+  for (const ep of endpoints) {
+    const cat = ep.category || 'unknown';
+    if (!categories[cat]) categories[cat] = [];
+    categories[cat].push(ep);
+  }
+
+  // Detect capabilities
+  const capabilities = [];
+  const readEndpoints = endpoints.filter(e => e.method === 'GET' || e.category === 'read');
+  const writeEndpoints = endpoints.filter(e => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(e.method));
+  const wsEndpoints = endpoints.filter(e => e.method?.startsWith('WS_') || e.source === 'websocket');
+  const sseEndpoints = endpoints.filter(e => e.method?.startsWith('SSE_') || e.source === 'eventsource');
+  const authedEndpoints = endpoints.filter(e => e.authHeaders?.length > 0);
+
+  if (readEndpoints.length > 0) capabilities.push(`📖 Read data (${readEndpoints.length} endpoints)`);
+  if (writeEndpoints.length > 0) capabilities.push(`✏️  Write/mutate (${writeEndpoints.length} endpoints)`);
+  if (wsEndpoints.length > 0) capabilities.push(`🔌 Real-time WebSocket streams (${wsEndpoints.length})`);
+  if (sseEndpoints.length > 0) capabilities.push(`📡 Server-Sent Events (${sseEndpoints.length})`);
+  if (authedEndpoints.length > 0) capabilities.push(`🔐 Authenticated access (${authedEndpoints.length} endpoints need auth)`);
+
+  // Suggest specific actions based on path patterns
+  const suggestions = [];
+  const pathLower = endpoints.map(e => (e.path || '').toLowerCase()).join(' ');
+  
+  if (pathLower.includes('search') || pathLower.includes('query')) suggestions.push('🔍 Search content');
+  if (pathLower.includes('create') || pathLower.includes('post') || pathLower.includes('compose')) suggestions.push('📝 Create new content');
+  if (pathLower.includes('delete') || pathLower.includes('remove')) suggestions.push('🗑️  Delete content');
+  if (pathLower.includes('notif')) suggestions.push('🔔 Read/manage notifications');
+  if (pathLower.includes('user') || pathLower.includes('profile') || pathLower.includes('account')) suggestions.push('👤 Access user/profile data');
+  if (pathLower.includes('timeline') || pathLower.includes('feed') || pathLower.includes('home')) suggestions.push('📰 Read feed/timeline');
+  if (pathLower.includes('message') || pathLower.includes('chat') || pathLower.includes('conversation')) suggestions.push('💬 Send/read messages');
+  if (pathLower.includes('upload') || pathLower.includes('media') || pathLower.includes('image')) suggestions.push('🖼️  Upload/manage media');
+  if (pathLower.includes('setting') || pathLower.includes('config') || pathLower.includes('preference')) suggestions.push('⚙️  Manage settings');
+  if (pathLower.includes('like') || pathLower.includes('favorite') || pathLower.includes('bookmark') || pathLower.includes('vote')) suggestions.push('❤️  Like/favorite/bookmark');
+  if (pathLower.includes('follow') || pathLower.includes('subscribe')) suggestions.push('👥 Follow/subscribe');
+  if (pathLower.includes('comment') || pathLower.includes('reply')) suggestions.push('💬 Comment/reply');
+  if (pathLower.includes('analytics') || pathLower.includes('stats') || pathLower.includes('metrics')) suggestions.push('📊 View analytics/stats');
+
+  console.log(`Neo capabilities for ${domain}`);
+  console.log(`  ${endpoints.length} endpoints discovered\n`);
+
+  if (capabilities.length > 0) {
+    console.log('Capabilities:');
+    for (const c of capabilities) console.log(`  ${c}`);
+    console.log();
+  }
+
+  if (suggestions.length > 0) {
+    console.log('Suggested actions:');
+    for (const s of suggestions) console.log(`  ${s}`);
+    console.log();
+  }
+
+  console.log('Endpoint categories:');
+  for (const [cat, eps] of Object.entries(categories).sort((a, b) => b[1].length - a[1].length)) {
+    console.log(`  ${cat}: ${eps.length} endpoint(s)`);
+    for (const ep of eps.slice(0, 5)) {
+      console.log(`    ${ep.method.padEnd(6)} ${ep.path}`);
+    }
+    if (eps.length > 5) console.log(`    ... and ${eps.length - 5} more`);
+  }
+};
+
 // neo mock — generate a mock HTTP server from schema
 commands.mock = async function(args) {
   const { positional, flags } = parseArgs(args || []);
@@ -2108,6 +2194,7 @@ Commands:
   neo tabs [filter]                       List open Chrome tabs
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
+  neo suggest <domain>                    Suggest AI capabilities for a domain
   neo mock <domain> [--port N]            Generate mock server from schema
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
   neo doctor                              Diagnose setup issues
