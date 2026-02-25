@@ -333,12 +333,19 @@ commands.schema = async function(args) {
           // Normalize paths: collapse variable segments (hashes, IDs, UUIDs)
           function normalizePath(p) {
             return p.split('/').map(function(seg) {
-              // GraphQL query hashes (e.g., oB-5XsHNAbjvARJEc8CZFw)
-              if (/^[a-zA-Z0-9_-]{15,30}$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg)) return ':hash';
-              // UUIDs
               if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return ':uuid';
-              // Numeric IDs (pure digits, 4+ chars)
               if (/^\\d{4,}$/.test(seg)) return ':id';
+              // GraphQL hashes: 15-30 chars, mixed case, high entropy
+              if (/^[a-zA-Z0-9_-]{15,30}$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg)) {
+                // Count digit-letter transitions (hashes have many, names don't)
+                var tr = 0;
+                for (var i = 1; i < seg.length; i++) {
+                  if (/\\d/.test(seg[i-1]) !== /\\d/.test(seg[i])) tr++;
+                }
+                if (tr >= 3) return ':hash';
+                // No 4+ consecutive lowercase = not a word = likely hash
+                if (!/[a-z]{4,}/.test(seg)) return ':hash';
+              }
               return seg;
             }).join('/');
           }
