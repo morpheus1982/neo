@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neo 捕获查看</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="header">
+        <h1>Neo v0.1 — 能抓能看</h1>
+        <p>捕获并按域名查看 API 调用</p>
+      </header>
+
+      <div class="toolbar">
+        <button id="refreshBtn" type="button">刷新</button>
+        <span id="summary">加载中...</span>
+      </div>
+
+      <div class="layout">
+        <section class="panel">
+          <h2>Domain 列表</h2>
+          <div id="domainList" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <h2 id="requestTitle">API Calls</h2>
+          <div id="requestList" class="list"></div>
+        </section>
+
+        <section class="panel detail-panel">
+          <h2>详细信息</h2>
+          <pre id="requestDetail">请选择一条 API 调用查看详情</pre>
+        </section>
+      </div>
+    </div>
+
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

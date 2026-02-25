@@ -1,0 +1,181 @@
+:root {
+  --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e293b 45%, #334155 100%);
+  --panel-bg: rgba(15, 23, 42, 0.75);
+  --panel-border: rgba(148, 163, 184, 0.25);
+  --text: #f8fafc;
+  --muted: #cbd5f5;
+  --accent: #38bdf8;
+  --accent-strong: #7dd3fc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-width: 920px;
+  min-height: 620px;
+  color: var(--text);
+  font-family: 'Trebuchet MS', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg-gradient);
+}
+
+.shell {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: fade-in 280ms ease;
+}
+
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.header p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+button {
+  border: 1px solid var(--panel-border);
+  background: rgba(56, 189, 248, 0.18);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 1.2fr) minmax(340px, 1.8fr) minmax(280px, 1.5fr);
+  gap: 12px;
+  min-height: 540px;
+}
+
+.panel {
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(3px);
+  padding: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--accent-strong);
+}
+
+.list {
+  overflow: auto;
+  flex: 1;
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.domain-item,
+.call-item {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px;
+  color: var(--text);
+  background: rgba(15, 23, 42, 0.6);
+  text-align: left;
+}
+
+.domain-item.active {
+  background: rgba(56, 189, 248, 0.2);
+  border-color: var(--accent);
+}
+
+.domain-item:hover,
+.call-item:hover {
+  border-color: var(--accent);
+}
+
+.domain-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.domain-name {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.domain-count {
+  color: var(--accent-strong);
+}
+
+.call-item {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+.call-url {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.detail-panel pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 100%;
+  color: #f1f5f9;
+  font-size: 12px;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 980px) {
+  body {
+    min-width: 0;
+  }
+
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
