@@ -99,6 +99,11 @@ node tools/neo.cjs flows x.com                      # Discover call sequence pat
 node tools/neo.cjs flows x.com --window 5000        # Custom time window
 node tools/neo.cjs deps x.com                       # Find response→request data dependencies
 node tools/neo.cjs deps x.com --min-confidence 1    # Show even single-occurrence links
+node tools/neo.cjs label x.com                      # Generate semantic labels for schema endpoints
+node tools/neo.cjs label x.com --dry-run            # Print labeling prompt only
+node tools/neo.cjs workflow discover x.com            # Discover multi-step workflows from dependencies
+node tools/neo.cjs workflow show upload                 # Show matching workflow definition
+node tools/neo.cjs workflow run upload                    # Execute workflow step-by-step
 node tools/neo.cjs suggest x.com                    # AI capability analysis for domain
 node tools/neo.cjs export-skill x.com               # Generate agent-ready API reference (Markdown)
 
@@ -150,7 +155,6 @@ The bridge creates a persistent WebSocket channel between the extension and CLI.
 │    └─ WebSocket Bridge client        │
 │       (auto-connects to bridge)      │
 │                                      │
-│  popup/ — Capture viewer UI          │
 └──────────────┬──────────────────────┘
                │ Chrome DevTools Protocol (port 9222)
 ┌──────────────┴──────────────────────┐
@@ -237,7 +241,7 @@ The interceptor ignores noise automatically:
 
 ## Roadmap
 
-- [x] Extension: capture + store + popup viewer
+- [x] Extension: capture + store + command-driven workflow
 - [x] CLI tools: unified `neo` CLI with subcommands
 - [x] Storage management: per-domain caps, auto-cleanup, rate limiting
 - [x] Schema: browser-side analysis, URL normalization, body structure extraction
@@ -257,8 +261,10 @@ The interceptor ignores noise automatically:
 - [x] HAR 1.2 export format for Postman/Charles/devtools interop
 - [x] OpenAPI 3.0 spec generation from captured schemas
 - [x] Batch schema generation (`--all`)
+- [x] Semantic endpoint labeling in `neo label` (heuristic + prompt-first workflow)
+- [x] Multi-step workflow discovery and execution in `neo workflow`
 - [ ] Dual-channel: Neo API-first → browser-use fallback
-- [ ] Multi-step workflow replay
+- [x] Multi-step workflow replay
 
 ## License
 

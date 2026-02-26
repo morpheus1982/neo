@@ -19,6 +19,10 @@
 //   neo replay <id> [--tab pattern]          Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
+//   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
+//   neo workflow discover <domain>           Discover multi-step workflows from dependencies
+//   neo workflow show <name>                 Show a saved workflow
+//   neo workflow run <name> [--params k=v]  Execute workflow step-by-step
 
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -29,6 +33,7 @@ const DB_NAME = 'neo-capture-v01';
 const STORE_NAME = 'capturedRequests';
 const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || 'ikikhldfkbfmcbandaagjomhchlehjap';
 const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'clawd/skills/neo/schemas');
+const WORKFLOW_FILE_EXT = '.workflows.json';
 
 // ─── CDP Helpers ────────────────────────────────────────────────
 
@@ -118,6 +123,635 @@ function parseDuration(str) {
   return n * unit;
 }
 
+function capitalize(text) {
+  const s = String(text || '');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+function normalizeMethod(method) {
+  return String(method || '').toUpperCase();
+}
+
+function endpointKey(method, path) {
+  return `${normalizeMethod(method)} ${path || ''}`;
+}
+
+function splitEndpointKey(key) {
+  const i = String(key).indexOf(' ');
+  if (i <= 0) return { method: normalizeMethod(key), path: '' };
+  return { method: normalizeMethod(key.slice(0, i)), path: key.slice(i + 1) };
+}
+
+function escapeForRegex(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function pathWords(raw) {
+  return String(raw || '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[-_\s]+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function cleanGraphqlOperation(rawSegment) {
+  const seg = String(rawSegment || '').replace(/[^a-zA-Z0-9]+/g, ' ').trim();
+  if (!seg) return '';
+  return pathWords(seg).join(' ');
+}
+
+function inferVerbFromMethod(method) {
+  const m = normalizeMethod(method);
+  if (m.startsWith('WS_') || m.startsWith('SSE_')) return 'Stream';
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'Get';
+  if (m === 'POST') return 'Create';
+  if (m === 'PUT' || m === 'PATCH') return 'Update';
+  if (m === 'DELETE') return 'Delete';
+  return 'Process';
+}
+
+function extractMeaningfulPathWord(path) {
+  const segments = String(path || '').split('?')[0].split('/').filter(Boolean);
+  const picked = [...segments].reverse().find(s => !s.startsWith(':') && s.length > 2) || segments[segments.length - 1] || 'endpoint';
+  const cleaned = cleanGraphqlOperation(picked);
+  return (cleaned || 'endpoint').replace(/^v\d+$/, '').trim() || 'endpoint';
+}
+
+function extractGraphQLOperation(path) {
+  const normalized = String(path || '').split('?')[0];
+  const segments = normalized.split('/').filter(Boolean);
+  for (const seg of [...segments].reverse()) {
+    const cleaned = cleanGraphqlOperation(seg);
+    if (!cleaned) continue;
+    const parts = cleaned.split(' ');
+    if (parts.length > 1 || /[A-Z]/.test(seg) || seg.includes('_') || seg.includes('-')) {
+      return cleaned;
+    }
+  }
+  return '';
+}
+
+function normalizeLabelText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function inferEndpointLabel(endpoint) {
+  if (!endpoint || !endpoint.path) return 'Unknown endpoint';
+  const gql = extractGraphQLOperation(endpoint.path);
+  if (gql) {
+    const lower = gql.toLowerCase();
+    if (lower.startsWith('delete ') || lower.startsWith('remove ')) {
+      return normalizeLabelText(`Delete ${gql.split(' ').slice(1).join(' ')}`);
+    }
+    return normalizeLabelText(`${inferVerbFromMethod(endpoint.method)} ${gql}`);
+  }
+
+  const triggerText = Array.isArray(endpoint.triggers) && endpoint.triggers[0]?.text;
+  if (triggerText) {
+    const lower = triggerText.toLowerCase();
+    if (lower.includes('post')) return `Post ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('upload')) return `Upload ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('save')) return `Save ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('delete') || lower.includes('remove')) return `Delete ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('search') || lower.includes('query')) return `Search ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('follow') || lower.includes('subscribe')) return `Follow ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('like') || lower.includes('favorite') || lower.includes('bookmark')) return `Like ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('message') || lower.includes('chat') || lower.includes('reply') || lower.includes('comment')) return `Create ${extractMeaningfulPathWord(endpoint.path)}`;
+  }
+
+  const segments = String(endpoint.path).split('?')[0].split('/').filter(Boolean);
+  const last = segments[segments.length - 1] || '';
+  const cleaned = cleanGraphqlOperation(last);
+  if (cleaned) {
+    const parts = cleaned.split(' ');
+    const verbs = ['create', 'post', 'delete', 'remove', 'update', 'patch', 'send', 'reply', 'comment', 'search', 'query', 'upload', 'attach', 'save', 'follow', 'like', 'bookmark', 'get', 'read', 'fetch'];
+    if (verbs.includes(parts[0])) {
+      return `${capitalize(parts[0])} ${parts.slice(1).join(' ')}`.trim();
+    }
+    if (parts.includes('list') || parts.includes('history')) return `Get ${parts.join(' ')}`;
+  }
+
+  return `${inferVerbFromMethod(endpoint.method)} ${extractMeaningfulPathWord(endpoint.path)}`.trim();
+}
+
+function buildLabelPromptForSchema(schema) {
+  const lines = [];
+  lines.push(`Domain: ${schema.domain}`);
+  lines.push('Goal: label each endpoint as a concise human-readable action phrase.');
+  lines.push('Return JSON mapping from endpoint key to label, e.g. {"POST /path": "Create content"}');
+  lines.push('Use only plain JSON, no markdown.');
+  lines.push('');
+  for (const ep of schema.endpoints || []) {
+    lines.push(endpointKey(ep.method, ep.path));
+    lines.push(`method: ${ep.method}`);
+    lines.push(`path: ${ep.path}`);
+    lines.push(`category: ${ep.category || 'unknown'}`);
+    if (ep.queryParams?.length) lines.push(`query params: ${ep.queryParams.join(', ')}`);
+    if (ep.requestBodyStructure) lines.push(`request body: ${JSON.stringify(ep.requestBodyStructure)}`);
+    if (ep.responseBodyStructure) lines.push(`response body: ${JSON.stringify(ep.responseBodyStructure)}`);
+    if (ep.triggers?.length) {
+      const t = ep.triggers[0];
+      lines.push(`trigger: ${t.event} ${t.text || t.selector || ''} (${t.count}x)`);
+    }
+    lines.push(`heuristic label: ${inferEndpointLabel(ep)}`);
+    lines.push('');
+  }
+  return lines.join('\\n');
+}
+
+function collectHeuristicLabels(schema) {
+  const output = {};
+  for (const ep of schema.endpoints || []) {
+    output[endpointKey(ep.method, ep.path)] = inferEndpointLabel(ep);
+  }
+  return output;
+}
+
+function coerceLabelInput(raw) {
+  if (process.env.NEO_ENDPOINT_LABELS) return JSON.parse(process.env.NEO_ENDPOINT_LABELS);
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const parsed = JSON.parse(trimmed);
+  if (Array.isArray(parsed)) {
+    const out = {};
+    for (const item of parsed) {
+      const key = item.key || (item.method && item.path ? endpointKey(item.method, item.path) : null);
+      if (key && typeof item.label === 'string') out[key] = item.label;
+    }
+    return out;
+  }
+  if (typeof parsed === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'string') {
+        out[k] = v;
+      } else if (v && typeof v === 'object' && typeof v.label === 'string') {
+        const key = v.key || k;
+        out[key] = v.label;
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+function readStdinText() {
+  if (process.stdin.isTTY) return Promise.resolve('');
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => { resolve(data); });
+  });
+}
+
+function loadSchemaFile(domain) {
+  const file = path.join(SCHEMA_DIR, `${domain}.json`);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return {
+      file,
+      schema: JSON.parse(fs.readFileSync(file, 'utf8')),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveSchemaFile(domain, schema) {
+  const file = path.join(SCHEMA_DIR, `${domain}.json`);
+  fs.mkdirSync(SCHEMA_DIR, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(schema, null, 2));
+  return file;
+}
+
+function setRequestField(target, field, value) {
+  if (!field || value === undefined) return;
+  if (String(field).startsWith('query.')) {
+    setByPath(target.query || (target.query = {}), field.slice(6), value);
+    return;
+  }
+  setByPath(target.body || (target.body = {}), field, value);
+}
+
+function normalizeResponseValue(value) {
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return value;
+    if (keys.length === 1) return normalizeResponseValue(value[keys[0]]);
+    return value;
+  }
+  if (Array.isArray(value)) return value.length ? value[0] : value;
+  const trimmed = String(value).trim();
+  return trimmed.length ? trimmed : value;
+}
+
+function mergeEndpointLabels(schema, labelsByKey, fallback = {}) {
+  const map = new Map((schema.endpoints || []).map(ep => [endpointKey(ep.method, ep.path), ep]));
+  let changed = 0;
+  let heuristic = 0;
+  for (const ep of (schema.endpoints || [])) {
+    const key = endpointKey(ep.method, ep.path);
+    const merged = labelsByKey[key] || fallback[key];
+    if (!merged) continue;
+    ep.label = merged.trim();
+    changed++;
+    if (!labelsByKey[key]) heuristic++;
+  }
+  return { changed, heuristic };
+}
+
+function normalizeForEndpointMatch(pathText) {
+  return String(pathText || '')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
+    .replace(/\/\d{4,}\b/g, '/:id')
+    .replace(/\/[0-9a-f]{24,}/gi, '/:hash');
+}
+
+function normalizeEndpointForDeps(method, url) {
+  try {
+    const u = new URL(url);
+    return endpointKey(method, normalizeForEndpointMatch(u.pathname));
+  } catch {
+    return endpointKey(method, String(url));
+  }
+}
+
+function collectLeafValues(payload) {
+  let value = payload;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return {};
+    }
+  }
+  if (!value || typeof value !== 'object') return {};
+
+  const out = {};
+  function walk(node, prefix) {
+    if (node === null || node === undefined) return;
+    if (typeof node === 'string') {
+      const v = node.trim();
+      if (v.length >= 3 && v.length <= 260) out[prefix] = v;
+      return;
+    }
+    if (typeof node === 'number') {
+      if (!Number.isFinite(node) || node <= 0) return;
+      out[prefix] = String(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (let i = 0; i < Math.min(node.length, 3); i++) {
+        walk(node[i], prefix ? `${prefix}[${i}]` : String(i));
+      }
+      return;
+    }
+    if (typeof node !== 'object') return;
+    for (const [k, v] of Object.entries(node)) {
+      walk(v, prefix ? `${prefix}.${k}` : k);
+    }
+  }
+
+  walk(value, '');
+  return out;
+}
+
+function collectRequestValues(capture) {
+  const values = {};
+  const bodyVals = collectLeafValues(capture.requestBody);
+  for (const [k, v] of Object.entries(bodyVals)) values[k] = v;
+  try {
+    const u = new URL(capture.url);
+    u.searchParams.forEach((value, key) => {
+      if (value.length >= 3 && value.length <= 260) values[`query.${key}`] = value;
+    });
+  } catch {}
+  return values;
+}
+
+function collectResponseValues(capture) {
+  return collectLeafValues(capture.responseBody);
+}
+
+function computeDependencyLinks(captures, windowMs = 10000, minConfidence = 2) {
+  const rawLinks = [];
+  for (let i = 0; i < captures.length; i++) {
+    const producer = captures[i];
+    if (!producer.respVals || !Object.keys(producer.respVals).length) continue;
+    for (let j = i + 1; j < captures.length; j++) {
+      const consumer = captures[j];
+      if (consumer.timestamp - producer.timestamp > windowMs) break;
+      if (!consumer.reqVals || !Object.keys(consumer.reqVals).length) continue;
+      if (producer.endpointKey === consumer.endpointKey) continue;
+      for (const [rKey, rVal] of Object.entries(producer.respVals)) {
+        if (!rVal || rVal.length < 4 || ['true', 'false', 'null', 'undefined', '0', '1', '2'].includes(rVal)) continue;
+        for (const [qKey, qVal] of Object.entries(consumer.reqVals)) {
+          if (rVal !== qVal) continue;
+          rawLinks.push({
+            producerEndpoint: producer.endpointKey,
+            consumerEndpoint: consumer.endpointKey,
+            respField: rKey,
+            reqField: qKey,
+            count: 1,
+          });
+        }
+      }
+    }
+  }
+  const merged = new Map();
+  for (const item of rawLinks) {
+    const k = `${item.producerEndpoint}|${item.consumerEndpoint}|${item.respField}|${item.reqField}`;
+    const existing = merged.get(k);
+    if (existing) existing.count += item.count;
+    else merged.set(k, item);
+  }
+  return [...merged.values()].filter(item => item.count >= minConfidence);
+}
+
+function loadWorkflowFiles() {
+  if (!fs.existsSync(SCHEMA_DIR)) return [];
+  return fs.readdirSync(SCHEMA_DIR)
+    .filter(f => f.endsWith(WORKFLOW_FILE_EXT))
+    .map(f => path.join(SCHEMA_DIR, f));
+}
+
+function loadWorkflowsFromDisk(domain) {
+  const files = loadWorkflowFiles();
+  if (!files.length) return [];
+  const out = [];
+  for (const file of files) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      for (const wf of raw.workflows || []) {
+        if (!domain || raw.domain === domain) out.push({ file, domain: raw.domain, ...wf });
+      }
+    } catch {}
+  }
+  return out;
+}
+
+function pathToParts(pathText) {
+  return String(pathText || '')
+    .replace(/\[(\d+)\]/g, '.$1')
+    .split('.')
+    .filter(Boolean);
+}
+
+function getByPath(obj, pathText) {
+  const parts = pathToParts(pathText);
+  let current = obj;
+  for (const part of parts) {
+    if (!current || typeof current !== 'object') return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function setByPath(obj, pathText, value) {
+  const parts = pathToParts(pathText);
+  if (!parts.length) return;
+  let current = obj;
+  for (let i = 0; i < parts.length; i++) {
+    const key = parts[i];
+    if (i === parts.length - 1) {
+      current[key] = value;
+      return;
+    }
+    if (!current[key] || typeof current[key] !== 'object') current[key] = {};
+    current = current[key];
+  }
+}
+
+function buildTemplateFromStructure(structure) {
+  if (!structure || typeof structure !== 'object') return {};
+  if (Array.isArray(structure)) {
+    return Array.isArray(structure[0]) ? [buildTemplateFromStructure(structure[0])] : [];
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(structure)) {
+    if (typeof v === 'string') {
+      if (v === 'number') out[k] = 0;
+      else if (v === 'boolean') out[k] = true;
+      else out[k] = '';
+    } else if (Array.isArray(v)) {
+      out[k] = v.length ? [buildTemplateFromStructure(v[0])] : [];
+    } else if (v && typeof v === 'object') {
+      out[k] = buildTemplateFromStructure(v);
+    } else {
+      out[k] = '';
+    }
+  }
+  return out;
+}
+
+function parseMaybeJson(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+function appendQueryParams(rawUrl, queryParams) {
+  if (!queryParams || typeof queryParams !== 'object') return rawUrl;
+  try {
+    const url = new URL(rawUrl);
+    for (const [k, v] of Object.entries(queryParams)) {
+      if (v === undefined || v === null || v === '') continue;
+      url.searchParams.set(k, String(v));
+    }
+    return url.toString();
+  } catch {
+    const entries = Object.entries(queryParams).map(([k, v]) => [k, String(v)]);
+    if (!entries.length) return rawUrl;
+    const suffix = new URLSearchParams(entries).toString();
+    return rawUrl.includes('?') ? `${rawUrl}&${suffix}` : `${rawUrl}?${suffix}`;
+  }
+}
+
+function parseWorkflowParams(args) {
+  const map = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--params' && args[i + 1]) {
+      const pair = args[i + 1];
+      const idx = pair.indexOf('=');
+      if (idx > 0) {
+        map[pair.slice(0, idx)] = pair.slice(idx + 1);
+      }
+      i++;
+    }
+  }
+  return map;
+}
+
+function pathPatternToRegex(pathText) {
+  const escaped = String(pathText || '')
+    .split('/')
+    .map(seg => seg.startsWith(':') ? '[^/]+' : escapeForRegex(seg))
+    .join('/');
+  return new RegExp(`^${escaped}(?:/.*)?$`);
+}
+
+function discoverWorkflowChains(dependencyLinks, minSteps, maxSteps, minEvidence) {
+  const eligibleLinks = dependencyLinks.filter(link => (link.count || 0) >= minEvidence);
+  if (!eligibleLinks.length) return [];
+
+  const byFrom = new Map();
+  for (const link of eligibleLinks) {
+    const arr = byFrom.get(link.producerEndpoint) || [];
+    arr.push(link);
+    byFrom.set(link.producerEndpoint, arr);
+  }
+
+  const consumerPaths = new Set(eligibleLinks.map(link => splitEndpointKey(link.consumerEndpoint).path));
+  const starts = eligibleLinks.filter(link => !consumerPaths.has(splitEndpointKey(link.producerEndpoint).path));
+  if (!starts.length) return [];
+
+  const chains = [];
+
+  function dfs(endpoint, path, visited) {
+    if (path.length >= maxSteps - 1) {
+      if (path.length >= minSteps - 1) chains.push([...path]);
+      return;
+    }
+
+    const nextLinks = byFrom.get(endpoint) || [];
+    const candidates = nextLinks.filter(link => !visited.has(link.consumerEndpoint));
+    if (!candidates.length) {
+      if (path.length >= minSteps - 1) chains.push([...path]);
+      return;
+    }
+
+    for (const link of candidates) {
+      path.push(link);
+      visited.add(link.consumerEndpoint);
+      dfs(link.consumerEndpoint, path, visited);
+      visited.delete(link.consumerEndpoint);
+      path.pop();
+    }
+  }
+
+  for (const link of starts) {
+    dfs(link.consumerEndpoint, [link], new Set([link.producerEndpoint, link.consumerEndpoint]));
+  }
+
+  const dedup = new Map();
+  for (const chain of chains) {
+    const key = chain.map(c => `${c.producerEndpoint}→${c.consumerEndpoint}#${c.respField}:${c.reqField}`).join('|');
+    dedup.set(key, chain);
+  }
+  return [...dedup.values()];
+}
+
+function toWorkflowNameFromChain(domain, chain) {
+  const endpoints = [chain[0].producerEndpoint];
+  for (const link of chain) endpoints.push(link.consumerEndpoint);
+  const nounParts = endpoints.map((ep) => {
+    const split = splitEndpointKey(ep).path.split('/').filter(Boolean);
+    return split[split.length - 1] || 'api';
+  });
+  const base = `${domain}-${nounParts.join('-to-')}`.toLowerCase()
+    .replace(/[^a-z0-9]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/-$/, '')
+    .slice(0, 60);
+  const score = chain.reduce((sum, c) => sum + c.count, 0);
+  return `${base}-${score}w`;
+}
+
+function buildWorkflowFromChains(domain, chains, schema) {
+  const endpointMap = new Map((schema.endpoints || []).map(ep => [endpointKey(ep.method, ep.path), ep]));
+  const workflows = [];
+  for (const chain of chains) {
+    const stepKeys = [chain[0].producerEndpoint];
+    for (const link of chain) stepKeys.push(link.consumerEndpoint);
+    const steps = [];
+    for (let i = 0; i < stepKeys.length; i++) {
+      const key = stepKeys[i];
+      const ep = endpointMap.get(key);
+      const parsed = splitEndpointKey(key);
+      steps.push({
+        endpointKey: key,
+        method: parsed.method,
+        path: parsed.path,
+        label: (ep && ep.label) || inferEndpointLabel(ep || { method: parsed.method, path: parsed.path }),
+      });
+    }
+
+    const transitions = [];
+    for (let i = 0; i < chain.length; i++) {
+      const link = chain[i];
+      transitions.push({
+        from: i,
+        to: i + 1,
+        fields: [{ sourceField: link.respField, targetField: link.reqField, count: link.count }],
+      });
+    }
+
+    workflows.push({
+      name: toWorkflowNameFromChain(domain, chain),
+      domain,
+      score: chain.reduce((sum, c) => sum + c.count, 0),
+      endpointCount: steps.length,
+      uniqueSignature: stepKeys.join(' -> '),
+      steps,
+      transitions,
+    });
+  }
+  return workflows;
+}
+
+function dedupeWorkflows(workflows) {
+  const map = new Map();
+  for (const wf of workflows) {
+    const existing = map.get(wf.uniqueSignature);
+    if (!existing || existing.score < wf.score) map.set(wf.uniqueSignature, wf);
+  }
+  return [...map.values()].sort((a, b) => b.score - a.score);
+}
+
+function loadDependencyData(wsUrl, domain) {
+  return cdpEval(wsUrl, `
+    (async () => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open("${DB_NAME}");
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("${STORE_NAME}", "readonly");
+        const store = tx.objectStore("${STORE_NAME}");
+        const idx = store.index("domain");
+        const results = [];
+        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+          const c = e.target.result;
+          if (!c) { resolve(results); return; }
+          const v = c.value;
+          results.push({
+            method: v.method,
+            url: v.url,
+            timestamp: v.timestamp,
+            requestBody: v.requestBody,
+            responseBody: v.responseBody,
+          });
+          c.continue();
+        };
+        idx.onerror = () => reject(tx.error);
+      });
+    })()
+  `, 60000).then(text => {
+    const rows = JSON.parse(text || '[]');
+    return rows.map(r => ({
+      ...r,
+      endpointKey: normalizeEndpointForDeps(r.method, r.url),
+      reqVals: collectRequestValues(r),
+      respVals: collectResponseValues(r),
+    }));
+  });
+}
+
 // ─── CLI Parsing ────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -144,6 +778,37 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+// neo label <domain> [--dry-run]
+commands.label = async function(args) {
+  const { positional, flags } = parseArgs(args);
+  const domain = positional[0];
+  if (!domain) {
+    console.error('Usage: neo label <domain> [--dry-run]');
+    process.exit(1);
+  }
+
+  const loaded = loadSchemaFile(domain);
+  if (!loaded) {
+    console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+    process.exit(1);
+  }
+
+  const schema = loaded.schema;
+  const prompt = buildLabelPromptForSchema(schema);
+  console.log(prompt);
+  if (flags['dry-run']) {
+    return;
+  }
+
+  const raw = await readStdinText();
+  const userLabels = coerceLabelInput(raw);
+  const heuristic = collectHeuristicLabels(schema);
+  const fallback = userLabels ? { ...heuristic, ...userLabels } : heuristic;
+  const { changed } = mergeEndpointLabels(schema, fallback);
+  saveSchemaFile(domain, schema);
+  console.log(`Updated ${changed} endpoint labels in ${loaded.file}`);
 };
 
 // neo status
@@ -985,12 +1650,13 @@ commands.schema = async function(args) {
           const auth = ep.authHeaders?.length ? ` [auth: ${ep.authHeaders.join(', ')}]` : '';
           const params = ep.queryParams?.length ? ` ?${ep.queryParams.join('&')}` : '';
           const body = ep.requestBodyStructure ? ` body:{${Object.keys(ep.requestBodyStructure).join(', ')}}` : '';
+          const label = ep.label ? ` [label: ${ep.label}]` : '';
           const variability = ep.bodyFieldVariability
             ? Object.entries(ep.bodyFieldVariability).filter(([,v]) => v === 'variable').map(([k]) => k)
             : [];
           const varNote = variability.length ? ` [varies: ${variability.join(', ')}]` : '';
           const cat = ep.category ? ` (${ep.category})` : '';
-          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}${varNote}${cat}`);
+          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${label}${auth}${body}${varNote}${cat}`);
           if (ep.triggers?.length) {
             for (const t of ep.triggers) {
               console.log(`    ← ${t.event} ${t.selector}${t.text ? ' "' + t.text + '"' : ''} (${t.count}x)`);
@@ -1956,6 +2622,260 @@ Groups endpoints by category and suggests high-level capabilities.`);
 };
 
 // neo deps — discover API dependency chains (response fields → request fields)
+commands.workflow = async function(args) {
+  const parsed = parseArgs(args || []);
+  const action = parsed.positional[0];
+  if (!action) {
+    console.log(`Usage:
+  neo workflow discover <domain> [--window ms] [--min-confidence n] [--min-steps n] [--max-steps n]
+  neo workflow show <name> [--json]
+  neo workflow run <name> [--params key=value]
+
+Discover and execute reusable multi-step workflows built from dependency chains.`);
+    return;
+  }
+
+  if (action === 'discover') {
+    const domain = parsed.positional[1];
+    if (!domain) {
+      console.error('Usage: neo workflow discover <domain> [--window ms] [--min-confidence n]');
+      process.exit(1);
+    }
+
+    const windowMs = parseInt(parsed.flags.window) || 10000;
+    const minConfidence = parseInt(parsed.flags['min-confidence'] || parsed.flags.minConfidence) || 2;
+    const minSteps = parseInt(parsed.flags['min-steps']) || 2;
+    const maxSteps = parseInt(parsed.flags['max-steps']) || 4;
+    const wsUrl = await findExtensionWs();
+    const captures = await loadDependencyData(wsUrl, domain);
+    if (!captures || captures.length < 2) {
+      console.error(`Not enough captures for ${domain} to discover workflow chains`);
+      return;
+    }
+    captures.sort((a, b) => a.timestamp - b.timestamp);
+    const links = computeDependencyLinks(captures, windowMs, minConfidence);
+    if (!links.length) {
+      console.log(`No dependency links found for ${domain}`);
+      return;
+    }
+
+    const schemaData = loadSchemaFile(domain);
+    const schema = schemaData ? schemaData.schema : { domain, endpoints: [] };
+    const chains = discoverWorkflowChains(links, minSteps, maxSteps, minConfidence);
+    const workflows = dedupeWorkflows(buildWorkflowFromChains(domain, chains, schema));
+    if (!workflows.length) {
+      console.log(`No workflow chains found for ${domain} (min-steps ${minSteps}, window ${windowMs}ms, min-confidence ${minConfidence})`);
+      return;
+    }
+
+    const payload = {
+      domain,
+      generatedAt: new Date().toISOString(),
+      windowMs,
+      minConfidence,
+      minSteps,
+      maxSteps,
+      workflows,
+    };
+    const outFile = path.join(SCHEMA_DIR, `${domain}${WORKFLOW_FILE_EXT}`);
+    fs.mkdirSync(SCHEMA_DIR, { recursive: true });
+    fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
+    console.log(`Discovered ${workflows.length} workflows for ${domain}`);
+    for (const wf of workflows.slice(0, 20)) {
+      console.log(`  - ${wf.name}`);
+    }
+    console.log(`Saved to ${outFile}`);
+    return;
+  }
+
+  if (action === 'show') {
+    const name = parsed.positional[1];
+    if (!name) {
+      console.error('Usage: neo workflow show <name> [--json]');
+      process.exit(1);
+    }
+    const workflows = loadWorkflowsFromDisk(parsed.flags.domain);
+    const matched = workflows.filter(w => w.name === name || w.name.toLowerCase().startsWith(name.toLowerCase()));
+    if (!matched.length) {
+      console.log(`No workflow matching "${name}"`);
+      return;
+    }
+    const exact = matched.filter(w => w.name === name);
+    const wf = exact.length === 1 ? exact[0] : matched[0];
+    if (parsed.flags.json) {
+      console.log(JSON.stringify(wf, null, 2));
+      return;
+    }
+    if (exact.length > 1) {
+      console.log(`Multiple workflows match "${name}":`);
+      for (const item of exact) {
+        console.log(`  - ${item.name}  (${item.domain}, ${item.endpointCount} steps)`);
+      }
+      console.log('Run with exact name or use a longer prefix.');
+      return;
+    }
+    console.log(`${wf.name} (${wf.domain}) — score ${wf.score}, ${wf.endpointCount} steps`);
+    console.log(`Created: ${wf.createdAt || wf.generatedAt || 'n/a'}\n`);
+    for (let i = 0; i < wf.steps.length; i++) {
+      const step = wf.steps[i];
+      const label = step.label ? ` [${step.label}]` : '';
+      console.log(`  ${i + 1}. ${step.endpointKey}${label}`);
+    }
+    console.log('\nTransitions:');
+    for (const transition of wf.transitions) {
+      for (const f of transition.fields) {
+        console.log(`  ${transition.from + 1} → ${transition.to + 1}: .${f.sourceField} -> .${f.targetField} (${f.count}x)`);
+      }
+    }
+    return;
+  }
+
+  if (action === 'run') {
+    const name = parsed.positional[1];
+    if (!name) {
+      console.error('Usage: neo workflow run <name> [--params key=value]');
+      process.exit(1);
+    }
+    const params = parseWorkflowParams(args);
+    const workflows = loadWorkflowsFromDisk(parsed.flags.domain);
+    const matched = workflows.filter(w => w.name === name || w.name.toLowerCase().startsWith(name.toLowerCase()));
+    if (!matched.length) {
+      console.log(`No workflow matching "${name}"`);
+      return;
+    }
+    const exact = matched.filter(w => w.name === name);
+    const wf = exact.length === 1 ? exact[0] : matched[0];
+    const schemaData = loadSchemaFile(wf.domain);
+    if (!schemaData) {
+      console.error(`No schema for ${wf.domain}. Run: neo schema generate ${wf.domain}`);
+      process.exit(1);
+    }
+    const schema = schemaData.schema;
+    const endpointMap = new Map((schema.endpoints || []).map(ep => [endpointKey(ep.method, ep.path), ep]));
+
+    const wsUrl = await findExtensionWs();
+    const captures = await loadDependencyData(wsUrl, wf.domain);
+    if (!captures.length) {
+      console.error(`No captures for ${wf.domain}`);
+      return;
+    }
+    captures.sort((a, b) => a.timestamp - b.timestamp);
+
+    const findLatestCapture = (key) => {
+      for (let i = captures.length - 1; i >= 0; i--) {
+        if (captures[i].endpointKey === key) return captures[i];
+      }
+      return null;
+    };
+
+    let previousResponse = null;
+    for (let i = 0; i < wf.steps.length; i++) {
+      const step = wf.steps[i];
+      const capture = findLatestCapture(step.endpointKey);
+      if (!capture) {
+        console.error(`Step ${i + 1}: no capture for ${step.endpointKey}`);
+        return;
+      }
+
+      const schemaEndpoint = endpointMap.get(step.endpointKey);
+      let requestPayload = schemaEndpoint?.requestBodyStructure
+        ? JSON.parse(JSON.stringify(buildTemplateFromStructure(schemaEndpoint.requestBodyStructure)))
+        : {};
+
+      const transitions = wf.transitions.filter(t => t.from === i - 1);
+      if (previousResponse && transitions.length > 0) {
+        const responseData = parseMaybeJson(previousResponse);
+        const responseValues = collectResponseValues(responseData);
+        for (const transition of transitions.flatMap(t => t.fields)) {
+          let value = undefined;
+          if (responseData && typeof responseData === 'object') value = getByPath(responseData, transition.sourceField);
+          if (value === undefined && responseValues && Object.prototype.hasOwnProperty.call(responseValues, transition.sourceField)) {
+            value = responseValues[transition.sourceField];
+          }
+          if (value !== undefined) {
+            setRequestField(requestPayload, transition.targetField, value);
+          }
+        }
+      }
+
+      for (const [k, v] of Object.entries(params)) {
+        setRequestField(requestPayload, k, v);
+      }
+
+      const query = requestPayload.query;
+      let url = appendQueryParams(capture.url, query);
+      if (query && typeof requestPayload === 'object') delete requestPayload.query;
+
+      const shouldSendBody = !(step.method === 'GET' || step.method === 'HEAD' || step.method === 'OPTIONS')
+        && requestPayload && Object.keys(requestPayload).length > 0;
+      const bodyText = shouldSendBody ? JSON.stringify(requestPayload) : null;
+      const method = step.method || 'GET';
+      const domain = wf.domain;
+
+      console.log(`\nStep ${i + 1}/${wf.steps.length}: ${step.endpointKey}`);
+      if (step.label) console.log(`  ${step.label}`);
+
+      // Auto-detect auth headers and execute
+      const autoHeadersRaw = await cdpEval(wsUrl, dbEval(`
+        var found = null;
+        store.openCursor(null, "prev").onsuccess = function(e) {
+          var c = e.target.result;
+          if (c) {
+            var v = c.value;
+            if (v.domain === ${JSON.stringify(domain)} && v.responseStatus >= 200 && v.responseStatus < 300 && Object.keys(v.requestHeaders || {}).length > 2) {
+              found = v.requestHeaders;
+              resolve(JSON.stringify(found));
+              return;
+            }
+            c.continue();
+          } else { resolve("{}"); }
+        };
+      `), 20000);
+      let autoHeaders = {};
+      try { autoHeaders = JSON.parse(autoHeadersRaw); } catch {}
+      const execHeaders = {};
+      for (const [k, v] of Object.entries(autoHeaders)) {
+        if (isAuthHeader(k)) execHeaders[k] = v;
+      }
+
+      const fetchOpts = { method, headers: execHeaders, credentials: 'include' };
+      if (bodyText) {
+        fetchOpts.body = bodyText;
+        if (!fetchOpts.headers['content-type'] && !fetchOpts.headers['Content-Type']) {
+          fetchOpts.headers['Content-Type'] = 'application/json';
+        }
+      }
+
+      const tab = await findTab(domain);
+      const result = await cdpEval(tab.webSocketDebuggerUrl, `
+        (async function() {
+          try {
+            var resp = await fetch(${JSON.stringify(url)}, ${JSON.stringify(fetchOpts)});
+            var text = await resp.text();
+            return JSON.stringify({
+              status: resp.status,
+              statusText: resp.statusText,
+              headers: Object.fromEntries(resp.headers.entries()),
+              body: text.length > 50000 ? text.slice(0, 50000) + '...[truncated]' : text
+            });
+          } catch (err) { return JSON.stringify({ error: err.message }); }
+        })()
+      `);
+      const parsed = JSON.parse(result);
+      if (parsed.error) {
+        console.error(`Step ${i + 1} failed: ${parsed.error}`);
+        return;
+      }
+      console.log(`  HTTP ${parsed.status} ${parsed.statusText}`);
+      try { previousResponse = JSON.parse(parsed.body); } catch { previousResponse = parsed.body; }
+    }
+    return;
+  }
+
+  console.log(`Unknown workflow command: ${action}`);
+};
+
+// neo deps — discover API dependency chains (response fields → request fields)
 commands.deps = async function(args) {
   const { positional, flags } = parseArgs(args || []);
   const domain = positional[0];
@@ -1977,107 +2897,7 @@ Options:
 
   const wsUrl = await findExtensionWs();
 
-  // Fetch captures with response/request bodies for dependency analysis
-  const rawData = await cdpEval(wsUrl, `
-    (async () => {
-      const db = await new Promise((resolve, reject) => {
-        const r = indexedDB.open("${DB_NAME}");
-        r.onsuccess = () => resolve(r.result);
-        r.onerror = () => reject(r.error);
-      });
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction("${STORE_NAME}", "readonly");
-        const store = tx.objectStore("${STORE_NAME}");
-        const idx = store.index("domain");
-        const results = [];
-        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
-          const cursor = e.target.result;
-          if (cursor) {
-            const v = cursor.value;
-            // Only include successful responses with parseable bodies
-            if (v.responseStatus >= 200 && v.responseStatus < 400) {
-              var respVals = null, reqVals = null;
-              // Extract leaf string/number values from response (1 level deep)
-              try {
-                var body = typeof v.responseBody === 'string' ? JSON.parse(v.responseBody) : v.responseBody;
-                if (body && typeof body === 'object') {
-                  respVals = {};
-                  function extract(obj, prefix) {
-                    if (!obj || typeof obj !== 'object') return;
-                    for (var k in obj) {
-                      if (!obj.hasOwnProperty(k)) continue;
-                      var val = obj[k];
-                      var path = prefix ? prefix + '.' + k : k;
-                      if (val === null || val === undefined) continue;
-                      if (typeof val === 'string' && val.length >= 3 && val.length <= 200) {
-                        respVals[path] = val;
-                      } else if (typeof val === 'number' && val > 0) {
-                        respVals[path] = String(val);
-                      } else if (typeof val === 'object' && !Array.isArray(val)) {
-                        extract(val, path);
-                      } else if (Array.isArray(val) && val.length > 0 && val.length <= 5) {
-                        for (var i = 0; i < Math.min(val.length, 3); i++) {
-                          if (typeof val[i] === 'string' && val[i].length >= 3) {
-                            respVals[path + '[' + i + ']'] = val[i];
-                          } else if (val[i] && typeof val[i] === 'object') {
-                            extract(val[i], path + '[0]');
-                          }
-                        }
-                      }
-                    }
-                  }
-                  extract(body, '');
-                }
-              } catch(ex) {}
-              // Extract values from request body + URL params
-              try {
-                var rb = typeof v.requestBody === 'string' ? JSON.parse(v.requestBody) : v.requestBody;
-                if (rb && typeof rb === 'object') {
-                  reqVals = {};
-                  function extractReq(obj, prefix) {
-                    if (!obj || typeof obj !== 'object') return;
-                    for (var k in obj) {
-                      if (!obj.hasOwnProperty(k)) continue;
-                      var val = obj[k];
-                      var path = prefix ? prefix + '.' + k : k;
-                      if (typeof val === 'string' && val.length >= 3 && val.length <= 200) {
-                        reqVals[path] = val;
-                      } else if (typeof val === 'number' && val > 0) {
-                        reqVals[path] = String(val);
-                      } else if (typeof val === 'object' && !Array.isArray(val)) {
-                        extractReq(val, path);
-                      }
-                    }
-                  }
-                  extractReq(rb, '');
-                }
-              } catch(ex) {}
-              // Also extract URL params as request values
-              try {
-                var u = new URL(v.url);
-                if (!reqVals) reqVals = {};
-                u.searchParams.forEach(function(val, key) {
-                  if (val.length >= 3) reqVals['query.' + key] = val;
-                });
-              } catch(ex) {}
-
-              results.push({
-                method: v.method,
-                url: v.url,
-                timestamp: v.timestamp,
-                respVals: respVals,
-                reqVals: reqVals
-              });
-            }
-            cursor.continue();
-          } else {
-            resolve(results);
-          }
-        };
-        tx.onerror = () => reject(tx.error);
-      });
-    })()
-  `, 60000);
+  const rawData = await loadDependencyData(wsUrl, domain);
 
   if (!rawData || rawData.length < 2) {
     console.error(`Not enough captures for ${domain} to detect dependencies`);
@@ -2086,59 +2906,19 @@ Options:
 
   // Sort by timestamp
   rawData.sort((a, b) => a.timestamp - b.timestamp);
-
-  // Normalize URL for display
-  function normEndpoint(url, method) {
-    try {
-      const u = new URL(url);
-      let p = u.pathname;
-      p = p.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
-      p = p.replace(/\/\d{4,}\b/g, '/:id');
-      return `${method} ${p}`;
-    } catch { return `${method} ${url}`; }
-  }
-
-  // Find value propagation: response field of A appears in request field of B
-  const links = new Map(); // "producerEndpoint → consumerEndpoint | respField → reqField" → count
-
-  for (let i = 0; i < rawData.length; i++) {
-    const producer = rawData[i];
-    if (!producer.respVals || Object.keys(producer.respVals).length === 0) continue;
-
-    // Look at subsequent captures within the window
-    for (let j = i + 1; j < rawData.length; j++) {
-      const consumer = rawData[j];
-      if (consumer.timestamp - producer.timestamp > windowMs) break;
-      if (!consumer.reqVals || Object.keys(consumer.reqVals).length === 0) continue;
-
-      const prodEp = normEndpoint(producer.url, producer.method);
-      const consEp = normEndpoint(consumer.url, consumer.method);
-      if (prodEp === consEp) continue; // Skip self-references
-
-      // Check if any response value appears in request values
-      for (const [respField, respVal] of Object.entries(producer.respVals)) {
-        // Skip very common values (booleans, small numbers, generic strings)
-        if (['true', 'false', 'null', 'undefined', '0', '1', '2'].includes(respVal)) continue;
-        if (respVal.length < 5) continue; // Too short to be meaningful
-
-        for (const [reqField, reqVal] of Object.entries(consumer.reqVals)) {
-          if (respVal === reqVal) {
-            const key = `${prodEp}|${consEp}|${respField}|${reqField}`;
-            links.set(key, (links.get(key) || 0) + 1);
-          }
-        }
-      }
-    }
-  }
+  const links = computeDependencyLinks(rawData, windowMs, minConf);
 
   // Filter by confidence and group by endpoint pair
   const pairLinks = new Map(); // "producer → consumer" → [{respField, reqField, count}]
-  for (const [key, count] of links) {
-    if (count < minConf) continue;
-    const [prodEp, consEp, respField, reqField] = key.split('|');
-    const pairKey = `${prodEp} → ${consEp}`;
+  for (const link of links) {
+    if ((link.count || 0) < minConf) continue;
+    const pairKey = `${link.producerEndpoint} → ${link.consumerEndpoint}`;
     if (!pairLinks.has(pairKey)) pairLinks.set(pairKey, []);
-    pairLinks.get(pairKey).push({ respField, reqField, count });
+    pairLinks.get(pairKey).push({
+      respField: link.respField,
+      reqField: link.reqField,
+      count: link.count,
+    });
   }
 
   if (pairLinks.size === 0) {
@@ -2516,6 +3296,8 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
+  neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns

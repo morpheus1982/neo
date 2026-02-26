@@ -413,6 +413,287 @@ test('handles malformed URL gracefully', () => {
   assert.strictEqual(normEndpoint('not-a-url', 'GET'), 'GET not-a-url');
 });
 
+// ─── Label heuristics (inspired by neo.cjs) ─────────────────
+
+function pathWords(raw) {
+  return String(raw || '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[-_\s]+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function cleanGraphqlOperation(rawSegment) {
+  const seg = String(rawSegment || '').replace(/[^a-zA-Z0-9]+/g, ' ').trim();
+  if (!seg) return '';
+  return pathWords(seg).join(' ');
+}
+
+function extractGraphQLOperation(pathText) {
+  const normalized = String(pathText || '').split('?')[0];
+  const segments = normalized.split('/').filter(Boolean);
+  for (const seg of [...segments].reverse()) {
+    const cleaned = cleanGraphqlOperation(seg);
+    if (!cleaned) continue;
+    const parts = cleaned.split(' ');
+    if (parts.length > 1 || /[A-Z]/.test(seg) || seg.includes('_') || seg.includes('-')) {
+      return cleaned;
+    }
+  }
+  return '';
+}
+
+function inferVerbFromMethod(method) {
+  const m = String(method || '').toUpperCase();
+  if (m.startsWith('WS_') || m.startsWith('SSE_')) return 'Stream';
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'Get';
+  if (m === 'POST') return 'Create';
+  if (m === 'PUT' || m === 'PATCH') return 'Update';
+  if (m === 'DELETE') return 'Delete';
+  return 'Process';
+}
+
+function extractMeaningfulPathWord(pathText) {
+  const segments = String(pathText || '').split('?')[0].split('/').filter(Boolean);
+  const picked = [...segments].reverse().find(s => !s.startsWith(':') && s.length > 2) || segments[segments.length - 1] || 'endpoint';
+  const cleaned = cleanGraphqlOperation(picked);
+  return (cleaned || 'endpoint').replace(/^v\d+$/, '').trim() || 'endpoint';
+}
+
+function inferEndpointLabel(endpoint) {
+  if (!endpoint || !endpoint.path) return 'Unknown endpoint';
+  const gql = extractGraphQLOperation(endpoint.path);
+  if (gql) {
+    const lower = gql.toLowerCase();
+    if (lower.startsWith('delete ') || lower.startsWith('remove ')) {
+      return `Delete ${gql.split(' ').slice(1).join(' ')}`.trim();
+    }
+    return `${inferVerbFromMethod(endpoint.method)} ${gql}`;
+  }
+
+  const triggerText = Array.isArray(endpoint.triggers) && endpoint.triggers[0]?.text;
+  if (triggerText) {
+    const lower = triggerText.toLowerCase();
+    if (lower.includes('post')) return `Post ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('upload')) return `Upload ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('save')) return `Save ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('delete') || lower.includes('remove')) return `Delete ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('search') || lower.includes('query')) return `Search ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('follow') || lower.includes('subscribe')) return `Follow ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('like') || lower.includes('favorite') || lower.includes('bookmark')) return `Like ${extractMeaningfulPathWord(endpoint.path)}`;
+    if (lower.includes('message') || lower.includes('chat') || lower.includes('reply') || lower.includes('comment')) return `Create ${extractMeaningfulPathWord(endpoint.path)}`;
+  }
+
+  const segments = String(endpoint.path).split('?')[0].split('/').filter(Boolean);
+  const last = segments[segments.length - 1] || '';
+  const cleaned = cleanGraphqlOperation(last);
+  if (cleaned) {
+    const parts = cleaned.split(' ');
+    const verbs = ['create', 'post', 'delete', 'remove', 'update', 'patch', 'send', 'reply', 'comment', 'search', 'query', 'upload', 'attach', 'save', 'follow', 'like', 'bookmark', 'get', 'read', 'fetch'];
+    if (verbs.includes(parts[0])) {
+      return `${parts[0].charAt(0).toUpperCase() + parts[0].slice(1)} ${parts.slice(1).join(' ')}`.trim();
+    }
+    if (parts.includes('list') || parts.includes('history')) return `Get ${parts.join(' ')}`;
+  }
+
+  return `${inferVerbFromMethod(endpoint.method)} ${extractMeaningfulPathWord(endpoint.path)}`.trim();
+}
+
+console.log('\nLabel heuristics:');
+test('extracts GraphQL operation name from path', () => {
+  assert.strictEqual(extractGraphQLOperation('/i/api/graphql/abc/CreateTweet'), 'create tweet');
+});
+test('infers label from GraphQL path for POST', () => {
+  assert.strictEqual(inferEndpointLabel({ method: 'POST', path: '/i/api/graphql/abc/CreateTweet' }), 'Create create tweet');
+});
+test('uses trigger wording when present', () => {
+  assert.strictEqual(
+    inferEndpointLabel({ method: 'POST', path: '/api/upload', triggers: [{ text: 'Upload image' }] }),
+    'Upload upload'
+  );
+});
+test('uses method+path fallback when no trigger or GraphQL', () => {
+  assert.strictEqual(
+    inferEndpointLabel({ method: 'GET', path: '/v1/posts/list' }),
+    'Get list'
+  );
+});
+test('extractGraphQLOperation handles snake_case and hyphenated path segments', () => {
+  assert.strictEqual(extractGraphQLOperation('/api/get_user_profile'), 'get user profile');
+  assert.strictEqual(extractGraphQLOperation('/api/upload-file'), 'upload file');
+});
+test('falls back to method-based fallback label', () => {
+  assert.strictEqual(
+    inferEndpointLabel({ method: 'PUT', path: '/v1/posts/item' }),
+    'Update item'
+  );
+});
+test('labels delete-like endpoints as Delete', () => {
+  assert.strictEqual(
+    inferEndpointLabel({ method: 'POST', path: '/api/delete_post' }),
+    'Delete post'
+  );
+});
+
+function discoverWorkflowChains(dependencyLinks, minSteps, maxSteps, minEvidence) {
+  const eligibleLinks = dependencyLinks.filter(link => (link.count || 0) >= minEvidence);
+  if (!eligibleLinks.length) return [];
+
+  const byFrom = new Map();
+  for (const link of eligibleLinks) {
+    const arr = byFrom.get(link.producerEndpoint) || [];
+    arr.push(link);
+    byFrom.set(link.producerEndpoint, arr);
+  }
+
+  const endpointPath = (key) => String(key || '').split(' ').slice(1).join(' ');
+  const consumers = new Set(eligibleLinks.map(link => endpointPath(link.consumerEndpoint)));
+  const starts = eligibleLinks.filter(link => !consumers.has(endpointPath(link.producerEndpoint)));
+  if (!starts.length) return [];
+
+  const chains = [];
+
+  function dfs(endpoint, path, visited) {
+    if (path.length >= maxSteps - 1) {
+      if (path.length >= minSteps - 1) chains.push([...path]);
+      return;
+    }
+
+    const nextLinks = byFrom.get(endpoint) || [];
+    const candidates = nextLinks.filter(link => !visited.has(link.consumerEndpoint));
+    if (!candidates.length) {
+      if (path.length >= minSteps - 1) chains.push([...path]);
+      return;
+    }
+
+    for (const link of candidates) {
+      path.push(link);
+      visited.add(link.consumerEndpoint);
+      dfs(link.consumerEndpoint, path, visited);
+      visited.delete(link.consumerEndpoint);
+      path.pop();
+    }
+  }
+
+  for (const link of starts) {
+    dfs(link.consumerEndpoint, [link], new Set([link.producerEndpoint, link.consumerEndpoint]));
+  }
+
+  const dedup = new Map();
+  for (const chain of chains) {
+    const key = chain.map(c => `${c.producerEndpoint}→${c.consumerEndpoint}#${c.respField}:${c.reqField}`).join('|');
+    dedup.set(key, chain);
+  }
+  return [...dedup.values()];
+}
+
+function toWorkflowNameFromChain(domain, chain) {
+  const endpoints = [chain[0].producerEndpoint];
+  for (const link of chain) endpoints.push(link.consumerEndpoint);
+  const nounParts = endpoints.map((ep) => {
+    const split = ep.split(' ').pop().split('/').filter(Boolean);
+    return split[split.length - 1] || 'api';
+  });
+  return `${domain}-${nounParts.join('-to-')}`.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/-$/, '').slice(0, 60);
+}
+
+function buildWorkflowFromChains(domain, chains, schema) {
+  const endpointMap = new Map((schema.endpoints || []).map(ep => [`${ep.method} ${ep.path}`, ep]));
+  const workflows = [];
+  for (const chain of chains) {
+    const stepKeys = [chain[0].producerEndpoint, ...chain.map((link) => link.consumerEndpoint)];
+    const steps = [];
+    for (const key of stepKeys) {
+      const ep = endpointMap.get(key);
+      const [method, path] = key.split(' ');
+      steps.push({
+        endpointKey: key,
+        method,
+        path,
+        label: (ep && ep.label) || inferEndpointLabel(ep || { method, path }),
+      });
+    }
+    workflows.push({
+      name: toWorkflowNameFromChain(domain, chain),
+      domain,
+      steps,
+      transitions: chain.map((link, i) => ({
+        from: i,
+        to: i + 1,
+        fields: [{ sourceField: link.respField, targetField: link.reqField, count: link.count }],
+      })),
+    });
+  }
+  return workflows;
+}
+
+console.log('\nWorkflow discovery:');
+test('discovers a linear dependency chain', () => {
+  const links = [
+    { producerEndpoint: 'GET /users', consumerEndpoint: 'POST /posts', respField: 'id', reqField: 'author_id', count: 3 },
+    { producerEndpoint: 'POST /posts', consumerEndpoint: 'GET /timeline', respField: 'post_id', reqField: 'id', count: 2 },
+  ];
+  const chains = discoverWorkflowChains(links, 2, 4, 2);
+  assert.strictEqual(chains.length, 1);
+  assert.strictEqual(chains[0].length, 2);
+  assert.strictEqual(chains[0][1].consumerEndpoint, 'GET /timeline');
+});
+
+test('respects minEvidence when discovering chains', () => {
+  const chains = discoverWorkflowChains([
+    { producerEndpoint: 'GET /users', consumerEndpoint: 'POST /posts', respField: 'id', reqField: 'author_id', count: 1 },
+  ], 2, 4, 2);
+  assert.strictEqual(chains.length, 0);
+});
+
+test('deduplicates identical chains', () => {
+  const links = [
+    { producerEndpoint: 'GET /users', consumerEndpoint: 'POST /posts', respField: 'id', reqField: 'author_id', count: 3 },
+    { producerEndpoint: 'GET /users', consumerEndpoint: 'POST /posts', respField: 'id', reqField: 'author_id', count: 3 },
+  ];
+  const chains = discoverWorkflowChains(links, 2, 4, 2);
+  assert.strictEqual(chains.length, 1);
+});
+
+test('builds workflow steps with labels', () => {
+  const links = [
+    { producerEndpoint: 'POST /uploadMedia', consumerEndpoint: 'POST /CreateTweet', respField: 'media_id', reqField: 'mediaId', count: 2 },
+  ];
+  const workflows = buildWorkflowFromChains('x.com', discoverWorkflowChains(links, 2, 4, 1), { endpoints: [{ method: 'POST', path: '/uploadMedia', label: 'Upload media' }] });
+  assert.strictEqual(workflows.length, 1);
+  assert.strictEqual(workflows[0].steps[0].label, 'Upload media');
+  assert.strictEqual(workflows[0].steps[1].endpointKey, 'POST /CreateTweet');
+});
+test('respects max steps when discovering chains', () => {
+  const links = [
+    { producerEndpoint: 'GET /a', consumerEndpoint: 'POST /b', respField: 'id', reqField: 'a', count: 2 },
+    { producerEndpoint: 'POST /b', consumerEndpoint: 'GET /c', respField: 'id', reqField: 'b', count: 2 },
+    { producerEndpoint: 'GET /c', consumerEndpoint: 'POST /d', respField: 'id', reqField: 'c', count: 2 },
+  ];
+  const chains = discoverWorkflowChains(links, 2, 2, 1);
+  const longChains = chains.filter(chain => chain.length > 1);
+  assert.strictEqual(longChains.length, 0);
+});
+test('avoids endpoint loops in workflow chains', () => {
+  const links = [
+    { producerEndpoint: 'GET /a', consumerEndpoint: 'POST /b', respField: 'id', reqField: 'a', count: 2 },
+    { producerEndpoint: 'POST /b', consumerEndpoint: 'GET /c', respField: 'id', reqField: 'b', count: 2 },
+    { producerEndpoint: 'GET /c', consumerEndpoint: 'POST /a', respField: 'id', reqField: 'c', count: 2 },
+  ];
+  const chains = discoverWorkflowChains(links, 2, 4, 1);
+  assert.ok(chains.every(chain => {
+    const seen = new Set();
+    for (const link of chain) {
+      if (seen.has(link.producerEndpoint) || seen.has(link.consumerEndpoint)) return false;
+      seen.add(link.producerEndpoint);
+      seen.add(link.consumerEndpoint);
+    }
+    return true;
+  }));
+});
+
 // ─── Edge cases ─────────────────────────────────────────────────
 
 console.log('\nedge cases:');

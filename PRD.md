@@ -28,7 +28,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - 对比 browser-use：在 API 层操作，快一个数量级，不受 UI 改版影响。
 - 一句话：**装个插件，用几天，AI 就学会了你用的所有工具。**
 
-## 当前状态 (v0.6.0)
+## 当前状态 (v1.0.0)
 
 ### ✅ 已完成
 
@@ -62,17 +62,19 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - `neo exec` — API 执行
 - `neo replay` — 捕获重放
 - `neo eval` — JS 执行
+- `neo label` — 启发式 endpoint 语义标注（可选 LLM 提示输入）
+- `neo workflow discover/show/run` — 多步工作流发现与执行
 - `neo tabs` — 列出 Chrome 标签页
 - `neo doctor` — 一键诊断 Chrome/CDP/扩展/IndexedDB/Schema/Bridge 状态
 - `neo reload` — CLI 重载扩展
 - `neo version` — 版本信息
 - 友好的错误消息 — Chrome 未启动、扩展未安装等场景
 
-**Popup UI**
-- 按 domain 分组查看捕获记录
-- 捕获详情展开（headers/body/response）
-- Copy as curl / Copy as neo 按钮
-- 实时计数更新
+**Workflow + Labeling**
+- `neo label` 为 schema endpoint 生成可读标签
+- `neo workflow discover` 从响应/请求依赖关系构建可重放链路
+- `neo workflow show/run` 支持查看与复用已发现工作流
+- 移除 popup 依赖，CLI 与 schema 继续作为主交互方式
 
 **OpenClaw Skill**
 - `~/clawd/skills/neo/SKILL.md` — AI 可直接使用 Neo 工具链
@@ -106,8 +108,8 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 
 **中期**
 - [ ] 双通道自动切换 — Neo 优先 → browser-use fallback
-- [ ] 多步 workflow 编排
-- [ ] AI 语义标注 — LLM 分析 endpoint 业务含义
+- [x] 多步 workflow 编排
+- [x] AI 语义标注 — `neo label`（启发式优先 + 可选 LLM 输入）
 - [x] API 依赖链发现 — `neo deps`：分析 response 字段如何流入后续 request
 
 **不做（至少现在）**

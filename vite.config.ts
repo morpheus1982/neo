@@ -8,8 +8,6 @@ const sourceRoot = path.resolve(extensionRoot, 'src');
 function copyExtensionAssets(): Plugin {
   const assets = [
     { from: path.resolve(sourceRoot, 'manifest.json'), to: 'manifest.json' },
-    { from: path.resolve(sourceRoot, 'popup/index.html'), to: 'popup.html' },
-    { from: path.resolve(sourceRoot, 'popup/popup.css'), to: 'popup.css' },
   ];
 
   return {
@@ -36,7 +34,6 @@ const entries: Record<string, { input: string; format: 'iife' | 'es' }> = {
   background: { input: path.resolve(sourceRoot, 'background/index.ts'), format: 'es' },
   content: { input: path.resolve(sourceRoot, 'content/index.ts'), format: 'iife' },
   inject: { input: path.resolve(sourceRoot, 'inject/interceptor.ts'), format: 'iife' },
-  popup: { input: path.resolve(sourceRoot, 'popup/popup.ts'), format: 'iife' },
 };
 
 const buildEntry = entries[entry];

@@ -62,6 +62,10 @@ neo flows <domain> [--window <ms>] [--min-count <n>]
                                         # Discover API call sequence patterns
 neo deps <domain> [--window <ms>] [--min-confidence <n>]
                                         # Discover API dependency chains (response→request data flow)
+neo label <domain> [--dry-run]         # Add semantic labels to schema endpoints
+neo workflow discover <domain>           # Discover reusable multi-step workflows
+neo workflow show <name>                # Show workflow definition and transitions
+neo workflow run <name> [--params k=v]  # Execute workflow step-by-step
 
 # Page interaction
 neo eval "<js>" --tab <pattern>         # Run JS in page context

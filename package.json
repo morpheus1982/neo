@@ -1,10 +1,10 @@
 {
   "name": "neo-extension",
   "private": true,
-  "version": "0.8.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build && NEO_ENTRY=popup vite build",
+    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build",
     "test": "node tools/neo.test.cjs"
   },
   "dependencies": {
