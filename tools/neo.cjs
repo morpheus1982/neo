@@ -9,14 +9,14 @@
 //   neo capture detail <id>                 Show full capture details
 //   neo capture stats <domain>              Domain statistics
 //   neo capture clear [domain]              Clear captures
-//   neo capture export [domain] [--format har] Export captures as JSON or HAR 1.2
+//   neo capture export [domain] [--format har] [--include-auth] Export captures as JSON or HAR 1.2
 //   neo capture import <file>               Import captures from JSON file
 //   neo schema generate <domain> [--all]     Generate API schema from captures
 //   neo schema show <domain>                Show cached schema
 //   neo exec <url> [options]                Execute fetch in browser tab context
 //   neo eval <js> --tab <pattern>           Evaluate JS in page context
 //   neo open <url>                          Open URL in Chrome
-//   neo replay <id> [--tab pattern]          Replay a captured API call
+//   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
@@ -107,9 +107,308 @@ const AUTH_HEADER_PATTERNS = [
   'x-api-key', 'api-key',
 ];
 
+const REDACTED_HEADER_VALUE = '[REDACTED]';
+const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+const FORBIDDEN_FETCH_HEADER_NAMES = ['host', 'content-length', 'cookie'];
+
 function isAuthHeader(name) {
-  const lk = name.toLowerCase();
-  return AUTH_HEADER_PATTERNS.includes(lk) || lk.startsWith('x-csrf') || lk.startsWith('x-api') || lk.startsWith('x-twitter');
+  const lk = String(name || '').toLowerCase();
+  if (!lk) return false;
+  if (lk === 'authorization' || lk === 'cookie' || lk === 'x-csrf-token') return true;
+  return AUTH_HEADER_PATTERNS.includes(lk)
+    || lk.startsWith('x-csrf')
+    || lk.startsWith('x-api')
+    || lk.startsWith('x-twitter')
+    || AUTH_HEADER_REGEX.test(lk);
+}
+
+function isRedactedAuthValue(value) {
+  return String(value || '').trim() === REDACTED_HEADER_VALUE;
+}
+
+function findHeaderKey(headers, name) {
+  const target = String(name || '').toLowerCase();
+  for (const key of Object.keys(headers || {})) {
+    if (key.toLowerCase() === target) return key;
+  }
+  return null;
+}
+
+function setHeaderValue(headers, name, value, overwrite = false) {
+  if (!headers || !name) return false;
+  const existing = findHeaderKey(headers, name);
+  if (existing) {
+    if (!overwrite) return false;
+    headers[existing] = String(value);
+    return true;
+  }
+  headers[name] = String(value);
+  return true;
+}
+
+function deleteHeaderCaseInsensitive(headers, name) {
+  const existing = findHeaderKey(headers, name);
+  if (!existing) return;
+  delete headers[existing];
+}
+
+function redactAuthHeaders(headers) {
+  const redacted = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    redacted[name] = isAuthHeader(name) ? REDACTED_HEADER_VALUE : String(value);
+  }
+  return redacted;
+}
+
+function extractAuthHeaders(headers, { includeRedacted = false } = {}) {
+  const selected = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (!isAuthHeader(name)) continue;
+    const stringValue = String(value);
+    if (!includeRedacted && isRedactedAuthValue(stringValue)) continue;
+    selected[name] = stringValue;
+  }
+  return selected;
+}
+
+function hasRedactedAuthHeaders(headers) {
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (!isAuthHeader(name)) continue;
+    if (isRedactedAuthValue(value)) return true;
+  }
+  return false;
+}
+
+function applyAuthHeaders(targetHeaders, sourceHeaders, overwrite = true) {
+  let applied = 0;
+  for (const [name, value] of Object.entries(sourceHeaders || {})) {
+    if (!isAuthHeader(name)) continue;
+    if (isRedactedAuthValue(value)) continue;
+    if (setHeaderValue(targetHeaders, name, String(value), overwrite)) {
+      applied++;
+    }
+  }
+  return applied;
+}
+
+function stripForbiddenFetchHeaders(headers) {
+  for (const name of FORBIDDEN_FETCH_HEADER_NAMES) {
+    deleteHeaderCaseInsensitive(headers, name);
+  }
+}
+
+function hostMatchesDomain(hostname, domain) {
+  const host = String(hostname || '').toLowerCase();
+  const expected = String(domain || '').toLowerCase();
+  if (!host || !expected) return false;
+  return host === expected || host.endsWith(`.${expected}`) || expected.endsWith(`.${host}`);
+}
+
+async function findStoredAuthHeaders(wsUrl, domain, limit = 80) {
+  const raw = await cdpEval(wsUrl, dbEval(`
+    var rows = [], domain = ${JSON.stringify(domain)}, limit = ${limit};
+    store.openCursor(null, "prev").onsuccess = function(e) {
+      var c = e.target.result;
+      if (c && rows.length < limit) {
+        var v = c.value;
+        if (v.domain === domain && v.requestHeaders) rows.push(v.requestHeaders);
+        c.continue();
+      } else {
+        resolve(JSON.stringify(rows));
+      }
+    };
+  `), 20000);
+
+  let rows = [];
+  try { rows = JSON.parse(raw || '[]'); }
+  catch { return {}; }
+
+  for (const headers of rows) {
+    const candidate = extractAuthHeaders(headers);
+    if (Object.keys(candidate).length > 0) return candidate;
+  }
+  return {};
+}
+
+function captureLiveAuthHeadersFromTab(tab, domain, probeUrl, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    if (!tab?.webSocketDebuggerUrl || !domain) { resolve({}); return; }
+
+    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    let nextId = 0;
+    const pending = new Map();
+    const matchingRequestIds = new Set();
+    let finished = false;
+    let timer = null;
+
+    const finish = (headers = {}) => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve(headers);
+    };
+
+    const send = (method, params = {}) => new Promise((resolveSend, rejectSend) => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        rejectSend(new Error('CDP socket not open'));
+        return;
+      }
+      const id = ++nextId;
+      pending.set(id, { resolveSend, rejectSend });
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+
+    ws.on('open', async () => {
+      try {
+        await send('Network.enable');
+        await send('Runtime.enable');
+        await send('Runtime.evaluate', {
+          expression: `(function() {
+            try {
+              var target = ${JSON.stringify(probeUrl || '')} || location.href;
+              fetch(target, { method: "GET", credentials: "include", cache: "no-store", mode: "cors" }).catch(function() {});
+            } catch (e) {}
+            return true;
+          })()`,
+          awaitPromise: true,
+          returnByValue: true
+        }).catch(() => {});
+      } catch {
+        finish({});
+      }
+    });
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); }
+      catch { return; }
+
+      if (msg.id && pending.has(msg.id)) {
+        const { resolveSend, rejectSend } = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) rejectSend(new Error(msg.error.message || String(msg.error)));
+        else resolveSend(msg.result);
+        return;
+      }
+
+      if (msg.method === 'Network.requestWillBeSent') {
+        const params = msg.params || {};
+        const req = params.request || {};
+        let host = '';
+        try { host = new URL(req.url || '').hostname; } catch {}
+        if (!hostMatchesDomain(host, domain)) return;
+        if (params.requestId) matchingRequestIds.add(params.requestId);
+        const auth = extractAuthHeaders(req.headers || {});
+        if (Object.keys(auth).length > 0) finish(auth);
+        return;
+      }
+
+      if (msg.method === 'Network.requestWillBeSentExtraInfo') {
+        const params = msg.params || {};
+        if (params.requestId && !matchingRequestIds.has(params.requestId)) return;
+        const auth = extractAuthHeaders(params.headers || {});
+        if (Object.keys(auth).length > 0) finish(auth);
+      }
+    });
+
+    ws.on('error', () => finish({}));
+    ws.on('close', () => finish({}));
+
+    timer = setTimeout(() => finish({}), timeoutMs);
+  });
+}
+
+function mergeAuthHeadersPreferLive(liveHeaders, fallbackHeaders) {
+  const merged = {};
+  applyAuthHeaders(merged, liveHeaders, true);
+  applyAuthHeaders(merged, fallbackHeaders, false);
+  return merged;
+}
+
+async function collectExecutionAuthHeaders({ wsUrl, tab, domain, probeUrl }) {
+  const [liveHeaders, fallbackHeaders] = await Promise.all([
+    captureLiveAuthHeadersFromTab(tab, domain, probeUrl).catch(() => ({})),
+    findStoredAuthHeaders(wsUrl, domain).catch(() => ({})),
+  ]);
+  return {
+    liveHeaders,
+    fallbackHeaders,
+    mergedHeaders: mergeAuthHeadersPreferLive(liveHeaders, fallbackHeaders),
+  };
+}
+
+function applyExportAuthPolicy(capture, liveHeadersByDomain = {}, includeAuth = false) {
+  const headers = { ...(capture.requestHeaders || {}) };
+  if (!includeAuth) {
+    return {
+      ...capture,
+      requestHeaders: redactAuthHeaders(headers),
+    };
+  }
+
+  const live = extractAuthHeaders(liveHeadersByDomain[capture.domain] || {});
+  const merged = {};
+
+  for (const [name, value] of Object.entries(headers)) {
+    if (!isAuthHeader(name)) {
+      merged[name] = String(value);
+      continue;
+    }
+
+    const liveKey = findHeaderKey(live, name);
+    merged[name] = liveKey ? live[liveKey] : REDACTED_HEADER_VALUE;
+  }
+
+  for (const [name, value] of Object.entries(live)) {
+    if (!findHeaderKey(merged, name)) {
+      merged[name] = value;
+    }
+  }
+
+  return {
+    ...capture,
+    requestHeaders: merged,
+  };
+}
+
+function pickTabForDomain(domain) {
+  return findTab(domain).catch(async () => {
+    const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+    const pages = tabs.filter(t => t.type === 'page');
+    return pages[0] || null;
+  });
+}
+
+async function collectLiveHeadersByDomainForExport(captures) {
+  const liveHeadersByDomain = {};
+  const probeByDomain = {};
+
+  for (const cap of captures || []) {
+    if (!cap || !cap.domain || probeByDomain[cap.domain]) continue;
+    try { probeByDomain[cap.domain] = `${new URL(cap.url).origin}/`; }
+    catch {}
+  }
+
+  for (const domain of Object.keys(probeByDomain)) {
+    try {
+      const tab = await pickTabForDomain(domain);
+      if (!tab) { liveHeadersByDomain[domain] = {}; continue; }
+      liveHeadersByDomain[domain] = await captureLiveAuthHeadersFromTab(tab, domain, probeByDomain[domain]);
+    } catch {
+      liveHeadersByDomain[domain] = {};
+    }
+  }
+
+  return liveHeadersByDomain;
+}
+
+function dropRedactedAuthHeaders(headers) {
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (isAuthHeader(name) && isRedactedAuthValue(value)) {
+      delete headers[name];
+    }
+  }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -990,6 +1289,7 @@ commands.capture = async function(args) {
       const domain = positional[1];
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
       const format = flags.format || 'json';
+      const includeAuth = flags['include-auth'] !== undefined;
       const r = await cdpEval(wsUrl, dbEval(`
         var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
         store.openCursor().onsuccess = function(e) {
@@ -1008,9 +1308,14 @@ commands.capture = async function(args) {
       `), 60000);
       try {
         const parsed = JSON.parse(r);
+        const liveHeadersByDomain = includeAuth
+          ? await collectLiveHeadersByDomainForExport(parsed)
+          : {};
+
+        const exportRows = parsed.map(cap => applyExportAuthPolicy(cap, liveHeadersByDomain, includeAuth));
         if (format === 'har') {
           // Convert to HAR 1.2 format (compatible with Postman, Charles, browser devtools)
-          const entries = parsed.map(cap => {
+          const entries = exportRows.map(cap => {
             const reqHeaders = Object.entries(cap.requestHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
             const respHeaders = Object.entries(cap.responseHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
             const u = (() => { try { return new URL(cap.url); } catch { return null; } })();
@@ -1060,7 +1365,7 @@ commands.capture = async function(args) {
           };
           console.log(JSON.stringify(har, null, 2));
         } else {
-          console.log(JSON.stringify(parsed, null, 2));
+          console.log(JSON.stringify(exportRows, null, 2));
         }
       } catch { console.log(r); }
       break;
@@ -1336,7 +1641,7 @@ commands.capture = async function(args) {
   neo capture detail <id>                 Show full capture details
   neo capture search <query>              Search captures by URL (--method, --status, --limit)
   neo capture clear [domain]              Clear captures (all or by domain)
-  neo capture export [domain] [--since 1h] [--format har] Export as JSON or HAR 1.2
+  neo capture export [domain] [--since 1h] [--format har] [--include-auth] Export as JSON or HAR 1.2
   neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures
   neo capture summary                     Quick overview for AI agents
@@ -1962,6 +2267,8 @@ commands.exec = async function(args) {
   const tabPattern = flags.tab || flags['tab-url'] || null;
   const body = flags.body || null;
   const headers = {};
+  const wsUrl = await findExtensionWs();
+  const domain = new URL(url).hostname;
 
   // Parse --header flags (may appear multiple times in raw argv)
   const rawArgs = process.argv.slice(3); // skip node, script, 'exec'
@@ -1973,38 +2280,38 @@ commands.exec = async function(args) {
     }
   }
 
-  // Auto-detect auth headers from captures
+  let tab;
+  if (tabPattern) {
+    tab = await findTab(tabPattern);
+  } else {
+    try { tab = await findTab(domain); }
+    catch { tab = await findTab(null); }
+  }
+
+  // Auto-detect auth headers from live browser traffic, with legacy capture fallback.
   if (flags['auto-headers'] !== undefined || !Object.keys(headers).some(k => k.toLowerCase() === 'authorization')) {
     try {
-      const domain = new URL(url).hostname;
-      const wsUrl = await findExtensionWs();
-      const raw = await cdpEval(wsUrl, dbEval(`
-        var found = null;
-        store.openCursor(null, "prev").onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            if (v.domain === "${domain}" && v.responseStatus >= 200 && v.responseStatus < 300 && Object.keys(v.requestHeaders).length > 2) {
-              found = v.requestHeaders;
-              resolve(JSON.stringify(found));
-              return;
-            }
-            c.continue();
-          } else { resolve("{}"); }
-        };
-      `));
-      const autoHeaders = JSON.parse(raw);
-      for (const [k, v] of Object.entries(autoHeaders)) {
-        if (isAuthHeader(k)) {
-          if (!headers[k]) headers[k] = v;
-        }
+      const probeUrl = `${new URL(url).origin}/`;
+      const { liveHeaders, fallbackHeaders } = await collectExecutionAuthHeaders({
+        wsUrl,
+        tab,
+        domain,
+        probeUrl,
+      });
+
+      const fromLive = applyAuthHeaders(headers, liveHeaders, false);
+      const fromFallback = applyAuthHeaders(headers, fallbackHeaders, false);
+
+      if (fromLive + fromFallback > 0) {
+        const segments = [];
+        if (fromLive > 0) segments.push(`${fromLive} live`);
+        if (fromFallback > 0) segments.push(`${fromFallback} fallback`);
+        console.error(`Auto-detected ${fromLive + fromFallback} auth headers (${segments.join(', ')})`);
       }
-      const autoCount = Object.keys(headers).length;
-      if (autoCount > 0) console.error(`Auto-detected ${autoCount} auth headers from captures`);
     } catch {}
   }
 
-  const tab = await findTab(tabPattern);
+  stripForbiddenFetchHeaders(headers);
   console.error(`${method} ${url.slice(0, 80)}... → tab: ${tab.url.slice(0, 50)}...`);
 
   const fetchOpts = { method, headers, credentials: 'include' };
@@ -2062,11 +2369,11 @@ commands.open = async function(args) {
   console.log(`Opened: ${tab.url}`);
 };
 
-// neo replay <id> [--tab pattern]
+// neo replay <id> [--tab pattern] [--auto-headers]
 commands.replay = async function(args) {
   const { positional, flags } = parseArgs(args);
   const id = positional[0];
-  if (!id) { console.error('Usage: neo replay <capture-id> [--tab pattern]'); process.exit(1); }
+  if (!id) { console.error('Usage: neo replay <capture-id> [--tab pattern] [--auto-headers]'); process.exit(1); }
 
   // Fetch the capture details
   const wsUrl = await findExtensionWs();
@@ -2096,12 +2403,30 @@ commands.replay = async function(args) {
   console.error(`Replaying: ${capture.method} ${capture.url.slice(0, 80)}...`);
   console.error(`Target tab: ${tab.url.slice(0, 60)}...`);
 
-  const headers = capture.requestHeaders || {};
-  // Remove headers that fetch shouldn't set
-  delete headers['host'];
-  delete headers['Host'];
-  delete headers['content-length'];
-  delete headers['Content-Length'];
+  const headers = { ...(capture.requestHeaders || {}) };
+
+  if (flags['auto-headers'] !== undefined || hasRedactedAuthHeaders(headers)) {
+    try {
+      const probeUrl = `${new URL(capture.url).origin}/`;
+      const { liveHeaders, fallbackHeaders } = await collectExecutionAuthHeaders({
+        wsUrl,
+        tab,
+        domain: capture.domain,
+        probeUrl,
+      });
+      const fromLive = applyAuthHeaders(headers, liveHeaders, true);
+      const fromFallback = applyAuthHeaders(headers, fallbackHeaders, false);
+      if (fromLive + fromFallback > 0) {
+        const segments = [];
+        if (fromLive > 0) segments.push(`${fromLive} live`);
+        if (fromFallback > 0) segments.push(`${fromFallback} fallback`);
+        console.error(`Auto-detected ${fromLive + fromFallback} auth headers (${segments.join(', ')})`);
+      }
+    } catch {}
+  }
+
+  dropRedactedAuthHeaders(headers);
+  stripForbiddenFetchHeaders(headers);
 
   const fetchOpts = { method: capture.method, headers, credentials: 'include' };
   if (capture.requestBody && capture.method !== 'GET') {
@@ -2815,28 +3140,21 @@ Discover and execute reusable multi-step workflows built from dependency chains.
       console.log(`\nStep ${i + 1}/${wf.steps.length}: ${step.endpointKey}`);
       if (step.label) console.log(`  ${step.label}`);
 
-      // Auto-detect auth headers and execute
-      const autoHeadersRaw = await cdpEval(wsUrl, dbEval(`
-        var found = null;
-        store.openCursor(null, "prev").onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            if (v.domain === ${JSON.stringify(domain)} && v.responseStatus >= 200 && v.responseStatus < 300 && Object.keys(v.requestHeaders || {}).length > 2) {
-              found = v.requestHeaders;
-              resolve(JSON.stringify(found));
-              return;
-            }
-            c.continue();
-          } else { resolve("{}"); }
-        };
-      `), 20000);
-      let autoHeaders = {};
-      try { autoHeaders = JSON.parse(autoHeadersRaw); } catch {}
+      const tab = await findTab(domain);
+      const probeUrl = (() => {
+        try { return `${new URL(url).origin}/`; }
+        catch { return tab.url; }
+      })();
+      const { liveHeaders, fallbackHeaders } = await collectExecutionAuthHeaders({
+        wsUrl,
+        tab,
+        domain,
+        probeUrl,
+      });
       const execHeaders = {};
-      for (const [k, v] of Object.entries(autoHeaders)) {
-        if (isAuthHeader(k)) execHeaders[k] = v;
-      }
+      applyAuthHeaders(execHeaders, liveHeaders, true);
+      applyAuthHeaders(execHeaders, fallbackHeaders, false);
+      stripForbiddenFetchHeaders(execHeaders);
 
       const fetchOpts = { method, headers: execHeaders, credentials: 'include' };
       if (bodyText) {
@@ -2846,7 +3164,6 @@ Discover and execute reusable multi-step workflows built from dependency chains.
         }
       }
 
-      const tab = await findTab(domain);
       const result = await cdpEval(tab.webSocketDebuggerUrl, `
         (async function() {
           try {
@@ -3292,7 +3609,7 @@ Commands:
                                           Manage captured API traffic
   neo schema generate|show|search <domain>  API schema management
   neo exec <url> [options]                Execute fetch in browser context
-  neo replay <id> [--tab pattern]         Replay a captured API call
+  neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
@@ -3314,7 +3631,7 @@ Options (for exec):
   --header "Key: Value"                   Request header (repeatable)
   --body '{"key": "value"}'              Request body
   --tab <pattern>                         Match tab by URL pattern
-  --auto-headers                          Auto-detect auth headers from captures
+  --auto-headers                          Auto-detect auth headers from live browser traffic
 
 Environment:
   NEO_CDP_URL        Chrome DevTools URL (default: http://localhost:9222)

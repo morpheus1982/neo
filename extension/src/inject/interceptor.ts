@@ -10,6 +10,8 @@ import {
   toAbsoluteUrl as toAbsoluteUrlBase,
   getSelector,
   getElementText,
+  redactAuthHeaders,
+  redactAuthHeaderValue,
 } from '../interceptor-utils';
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
@@ -186,13 +188,15 @@ if (!window.__neoInterceptorInstalled) {
       input instanceof Request ? input.headers : (init?.headers as Headers | Record<string, string> | undefined)
     );
 
-    const reqHeaders = Object.keys(requestHeaders).length
+    const rawRequestHeaders = Object.keys(requestHeaders).length
       ? requestHeaders
       : init?.headers
         ? parseHeaders(init.headers as Headers | Record<string, string>)
         : {};
 
-    if (shouldSkipRequest(url, reqHeaders)) {
+    const reqHeaders = redactAuthHeaders(rawRequestHeaders);
+
+    if (shouldSkipRequest(url, rawRequestHeaders)) {
       return originalFetch(input, init);
     }
 
@@ -315,7 +319,7 @@ if (!window.__neoInterceptorInstalled) {
   originalXHRProto.setRequestHeader = function setRequestHeader(this: XMLHttpRequest, name: string, value: string) {
     const meta = (this as any)[XHR_META_KEY] as XHRSnapshot | undefined;
     if (meta) {
-      meta.headers[name] = value;
+      meta.headers[name] = redactAuthHeaderValue(name, value);
     }
     return originalXHRsetHeader.call(this, name, value);
   } as typeof originalXHRsetHeader;

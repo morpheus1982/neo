@@ -1,5 +1,6 @@
 import { addCapture, db } from '../db';
 import { isNeoCaptureMessage, NEO_CAPTURE_MESSAGE_TYPE, CapturedRequest } from '../types';
+import { redactAuthHeaders } from '../interceptor-utils';
 
 const tabCaptureCounts = new Map<number, number>();
 
@@ -255,27 +256,32 @@ async function getActiveTabId(): Promise<number | undefined> {
 
 async function persistCapture(capture: CapturedRequest): Promise<void> {
   try {
-    await addCapture(capture);
+    const persistedCapture: CapturedRequest = {
+      ...capture,
+      requestHeaders: redactAuthHeaders(capture.requestHeaders || {}),
+    };
 
-    if (capture.tabId > -1) {
-      const existing = tabCaptureCounts.get(capture.tabId) || 0;
-      tabCaptureCounts.set(capture.tabId, existing + 1);
+    await addCapture(persistedCapture);
+
+    if (persistedCapture.tabId > -1) {
+      const existing = tabCaptureCounts.get(persistedCapture.tabId) || 0;
+      tabCaptureCounts.set(persistedCapture.tabId, existing + 1);
     }
 
-    await refreshBadge(capture.tabId);
+    await refreshBadge(persistedCapture.tabId);
 
     // Stream to bridge in real-time
     bridgeSend('capture', {
-      id: capture.id,
-      method: capture.method,
-      url: capture.url,
-      domain: capture.domain,
-      status: capture.responseStatus,
-      duration: capture.duration,
-      source: capture.source,
-      trigger: capture.trigger,
-      timestamp: capture.timestamp,
-      tabUrl: capture.tabUrl,
+      id: persistedCapture.id,
+      method: persistedCapture.method,
+      url: persistedCapture.url,
+      domain: persistedCapture.domain,
+      status: persistedCapture.responseStatus,
+      duration: persistedCapture.duration,
+      source: persistedCapture.source,
+      trigger: persistedCapture.trigger,
+      timestamp: persistedCapture.timestamp,
+      tabUrl: persistedCapture.tabUrl,
     });
   } catch (err) {
     console.error('[Neo] persistCapture failed:', err);

@@ -19,9 +19,78 @@ const AUTH_HEADER_PATTERNS = [
   'x-api-key', 'api-key',
 ];
 
+const REDACTED_HEADER_VALUE = '[REDACTED]';
+const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+
 function isAuthHeader(name) {
-  const lk = name.toLowerCase();
-  return AUTH_HEADER_PATTERNS.includes(lk) || lk.startsWith('x-csrf') || lk.startsWith('x-api') || lk.startsWith('x-twitter');
+  const lk = String(name || '').toLowerCase();
+  if (!lk) return false;
+  if (lk === 'authorization' || lk === 'cookie' || lk === 'x-csrf-token') return true;
+  return AUTH_HEADER_PATTERNS.includes(lk)
+    || lk.startsWith('x-csrf')
+    || lk.startsWith('x-api')
+    || lk.startsWith('x-twitter')
+    || AUTH_HEADER_REGEX.test(lk);
+}
+
+function findHeaderKey(headers, name) {
+  const target = String(name || '').toLowerCase();
+  for (const key of Object.keys(headers || {})) {
+    if (key.toLowerCase() === target) return key;
+  }
+  return null;
+}
+
+function redactAuthHeaders(headers) {
+  const redacted = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    redacted[name] = isAuthHeader(name) ? REDACTED_HEADER_VALUE : String(value);
+  }
+  return redacted;
+}
+
+function extractAuthHeaders(headers) {
+  const selected = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (!isAuthHeader(name)) continue;
+    if (String(value) === REDACTED_HEADER_VALUE) continue;
+    selected[name] = String(value);
+  }
+  return selected;
+}
+
+function applyExportAuthPolicy(capture, liveHeadersByDomain = {}, includeAuth = false) {
+  const headers = { ...(capture.requestHeaders || {}) };
+  const live = extractAuthHeaders(liveHeadersByDomain[capture.domain] || {});
+  const merged = {};
+
+  for (const [name, value] of Object.entries(headers)) {
+    if (!isAuthHeader(name)) {
+      merged[name] = String(value);
+      continue;
+    }
+
+    if (!includeAuth) {
+      merged[name] = REDACTED_HEADER_VALUE;
+      continue;
+    }
+
+    const liveKey = findHeaderKey(live, name);
+    merged[name] = liveKey ? live[liveKey] : REDACTED_HEADER_VALUE;
+  }
+
+  if (includeAuth) {
+    for (const [name, value] of Object.entries(live)) {
+      if (!findHeaderKey(merged, name)) {
+        merged[name] = value;
+      }
+    }
+  }
+
+  return {
+    ...capture,
+    requestHeaders: merged,
+  };
 }
 
 function parseDuration(str) {
@@ -55,10 +124,86 @@ test('recognizes authorization', () => assert(isAuthHeader('Authorization')));
 test('recognizes x-csrf-token', () => assert(isAuthHeader('X-CSRF-Token')));
 test('recognizes x-api-key', () => assert(isAuthHeader('x-api-key')));
 test('recognizes x-twitter-* prefix', () => assert(isAuthHeader('x-twitter-something')));
+test('recognizes cookie', () => assert(isAuthHeader('Cookie')));
+test('matches token regex', () => assert(isAuthHeader('x-access-token')));
+test('matches auth regex', () => assert(isAuthHeader('x-service-auth')));
+test('matches key regex', () => assert(isAuthHeader('client-key')));
+test('matches secret regex', () => assert(isAuthHeader('x-secret-value')));
+test('matches session regex', () => assert(isAuthHeader('session-id')));
 test('rejects content-type', () => assert(!isAuthHeader('Content-Type')));
 test('rejects accept', () => assert(!isAuthHeader('Accept')));
 test('rejects user-agent', () => assert(!isAuthHeader('User-Agent')));
-test('rejects cookie', () => assert(!isAuthHeader('Cookie')));
+
+console.log('\nredactAuthHeaders:');
+test('redacts known auth headers and keeps normal headers', () => {
+  const headers = redactAuthHeaders({
+    Authorization: 'Bearer abc',
+    Cookie: 'session=123',
+    Accept: 'application/json',
+  });
+  assert.strictEqual(headers.Authorization, REDACTED_HEADER_VALUE);
+  assert.strictEqual(headers.Cookie, REDACTED_HEADER_VALUE);
+  assert.strictEqual(headers.Accept, 'application/json');
+});
+test('redacts regex-matched auth headers', () => {
+  const headers = redactAuthHeaders({
+    'x-session-id': 's1',
+    'x-secret-key': 'k1',
+    'x-custom-token': 't1',
+  });
+  assert.strictEqual(headers['x-session-id'], REDACTED_HEADER_VALUE);
+  assert.strictEqual(headers['x-secret-key'], REDACTED_HEADER_VALUE);
+  assert.strictEqual(headers['x-custom-token'], REDACTED_HEADER_VALUE);
+});
+
+console.log('\nexport auth policy:');
+test('export redacts auth headers by default', () => {
+  const cap = {
+    domain: 'api.example.com',
+    requestHeaders: {
+      Authorization: 'Bearer legacy',
+      'x-csrf-token': 'csrf-legacy',
+      Accept: 'application/json',
+    }
+  };
+  const out = applyExportAuthPolicy(cap, {}, false);
+  assert.strictEqual(out.requestHeaders.Authorization, REDACTED_HEADER_VALUE);
+  assert.strictEqual(out.requestHeaders['x-csrf-token'], REDACTED_HEADER_VALUE);
+  assert.strictEqual(out.requestHeaders.Accept, 'application/json');
+});
+test('export include-auth uses live headers (not stored values)', () => {
+  const cap = {
+    domain: 'api.example.com',
+    requestHeaders: {
+      Authorization: 'Bearer old-token',
+      'x-csrf-token': REDACTED_HEADER_VALUE,
+      Accept: 'application/json',
+    }
+  };
+  const out = applyExportAuthPolicy(cap, {
+    'api.example.com': {
+      Authorization: 'Bearer live-token',
+      'x-csrf-token': 'live-csrf',
+      Cookie: 'session=live',
+    }
+  }, true);
+  assert.strictEqual(out.requestHeaders.Authorization, 'Bearer live-token');
+  assert.strictEqual(out.requestHeaders['x-csrf-token'], 'live-csrf');
+  assert.strictEqual(out.requestHeaders.Cookie, 'session=live');
+  assert.strictEqual(out.requestHeaders.Accept, 'application/json');
+});
+test('export include-auth keeps auth headers redacted when no live headers', () => {
+  const cap = {
+    domain: 'api.example.com',
+    requestHeaders: {
+      Authorization: 'Bearer old-token',
+      'x-session-id': 'abc',
+    }
+  };
+  const out = applyExportAuthPolicy(cap, {}, true);
+  assert.strictEqual(out.requestHeaders.Authorization, REDACTED_HEADER_VALUE);
+  assert.strictEqual(out.requestHeaders['x-session-id'], REDACTED_HEADER_VALUE);
+});
 
 console.log('\nparseDuration:');
 test('parses seconds', () => assert.strictEqual(parseDuration('30s'), 30000));
