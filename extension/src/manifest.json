@@ -13,8 +13,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Neo",
-    "default_popup": "popup.html"
+    "default_title": "Neo"
   },
   "content_scripts": [
     {
