@@ -37,6 +37,36 @@ const SKIP_PROTOCOLS = new Set([
   'chrome-extension:', 'moz-extension:', 'safari-extension:', 'data:', 'blob:'
 ]);
 
+// ── Header redaction ──────────────────────────────────────────────
+
+export const REDACTED_HEADER_VALUE = '[REDACTED]';
+
+const AUTH_HEADER_EXACT_NAMES = new Set([
+  'authorization',
+  'cookie',
+  'x-csrf-token',
+]);
+
+const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+
+export function shouldRedactAuthHeader(name: string): boolean {
+  const lower = String(name || '').toLowerCase();
+  if (!lower) return false;
+  return AUTH_HEADER_EXACT_NAMES.has(lower) || AUTH_HEADER_REGEX.test(lower);
+}
+
+export function redactAuthHeaderValue(name: string, value: string): string {
+  return shouldRedactAuthHeader(name) ? REDACTED_HEADER_VALUE : value;
+}
+
+export function redactAuthHeaders(headers: Record<string, string>): Record<string, string> {
+  const redacted: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    redacted[name] = redactAuthHeaderValue(name, String(value));
+  }
+  return redacted;
+}
+
 /**
  * Determine if a request URL should be skipped (not captured).
  * baseHref is used for relative URL resolution (defaults to empty).
