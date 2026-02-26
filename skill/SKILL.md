@@ -15,7 +15,11 @@ Captures fetch, XHR, WebSocket, and EventSource/SSE traffic with DOM trigger cor
 - User asks what APIs a website uses
 - Replaying or debugging API calls
 
-## CLI: `node ~/clawd/neo/neo.cjs`
+## CLI
+
+Run from the repo root: `node tools/neo.cjs <command>`
+
+Below, `neo` is shorthand for `node tools/neo.cjs` (add an alias or symlink for convenience).
 
 ```bash
 # Overview
@@ -109,7 +113,7 @@ This maps: user intent → UI element → API call → parameterizable fields.
 
 ## Schema Knowledge Base
 
-Schemas at `~/clawd/skills/neo/schemas/<domain>.json` — local API knowledge.
+Schemas are saved alongside the CLI (e.g. `schemas/<domain>.json`) — local API knowledge.
 
 Before calling an API, check schema: `neo schema show <domain>`
 No schema? Generate: `neo schema generate <domain>` (requires captures)
@@ -142,8 +146,8 @@ Use bridge for long-running monitoring. Use CLI commands for one-off queries.
 
 ## Key facts
 - Extension ID: `ikikhldfkbfmcbandaagjomhchlehjap`
-- Extension dist: `~/neo/extension-dist`
-- Source: `/tmp/neo/` (git repo at github.com/4ier/neo)
+- Extension dist: see repo `extension/` directory
+- Source: https://github.com/4ier/neo
 - API calls execute in browser context — cookies/auth inherited automatically
 - Chrome must run with CDP on port 9222
 - Per-domain capture cap: 500 entries, auto-cleanup
