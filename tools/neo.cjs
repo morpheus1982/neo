@@ -30,6 +30,7 @@
 //   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
 //   neo select @ref "value"                  Select option value by @ref
 //   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
+//   neo get text @ref | neo get url | neo get title  Extract page/element info
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1940,6 +1941,59 @@ commands.screenshot = async function(args, context = {}) {
     console.error('TODO: screenshot --annotate is not implemented yet');
   }
   console.log(outputPath);
+};
+
+// neo get text @ref | neo get url | neo get title
+commands.get = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const subject = positional[0];
+  if (!subject) {
+    console.error('Usage: neo get text @ref | neo get url | neo get title');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+
+  if (subject === 'text') {
+    const ref = positional[1];
+    if (!ref || positional.length > 2) {
+      console.error('Usage: neo get text @ref');
+      process.exit(1);
+    }
+    const target = await resolveRef(sessionName, ref);
+    const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+      objectId: target.objectId,
+      functionDeclaration: `function() {
+        if (!this) return '';
+        if (typeof this.innerText === 'string') return this.innerText;
+        if (typeof this.textContent === 'string') return this.textContent;
+        return '';
+      }`,
+      returnByValue: true,
+    });
+    const text = result && result.result ? result.result.value : '';
+    console.log(text === undefined || text === null ? '' : String(text));
+    return;
+  }
+
+  if (subject === 'url' || subject === 'title') {
+    if (positional.length > 1) {
+      console.error(`Usage: neo get ${subject}`);
+      process.exit(1);
+    }
+    const expression = subject === 'url' ? 'location.href' : 'document.title';
+    const result = await cdpSend(pageWsUrl, 'Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+    });
+    const value = result && result.result ? result.result.value : '';
+    console.log(value === undefined || value === null ? '' : String(value));
+    return;
+  }
+
+  console.error('Usage: neo get text @ref | neo get url | neo get title');
+  process.exit(1);
 };
 
 // neo label <domain> [--dry-run]
@@ -4492,6 +4546,7 @@ Commands:
   neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
   neo select @ref "value"                  Select option value by @ref
   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
+  neo get text @ref | neo get url | neo get title  Extract page/element info
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
