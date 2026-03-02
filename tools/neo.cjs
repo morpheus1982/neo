@@ -22,6 +22,7 @@
 //   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo sessions                            List saved active sessions
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+//   neo click @ref [--new-tab]              Click element by @ref
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -263,6 +264,72 @@ function formatSnapshot(nodes) {
     rows.push(`${indent}${ref}  [${role}] "${name}"`);
   }
   return rows.join('\n');
+}
+
+function getSessionPageWsUrl(sessionName = DEFAULT_SESSION_NAME) {
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+  return session.pageWsUrl;
+}
+
+function getBackendNodeIdFromRef(session, ref) {
+  const normalizedRef = String(ref || '');
+  if (!normalizedRef.startsWith('@')) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
+    ? refs[normalizedRef].backendDOMNodeId
+    : null;
+  if (!backendDOMNodeId) {
+    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+  }
+  return backendDOMNodeId;
+}
+
+function centerFromQuad(quad) {
+  if (!Array.isArray(quad) || quad.length < 8) return null;
+  const xs = [quad[0], quad[2], quad[4], quad[6]].map(Number).filter(Number.isFinite);
+  const ys = [quad[1], quad[3], quad[5], quad[7]].map(Number).filter(Number.isFinite);
+  if (xs.length !== 4 || ys.length !== 4) return null;
+  const x = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+  const y = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+  return { x, y };
+}
+
+async function resolveRef(sessionName, ref, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : cdpSend;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const backendDOMNodeId = getBackendNodeIdFromRef(session, ref);
+  const resolved = await sendFn(session.pageWsUrl, 'DOM.resolveNode', { backendNodeId: backendDOMNodeId });
+  const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (!objectId) {
+    throw new Error(`Failed to resolve node for ${ref}`);
+  }
+
+  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  const quad = boxModel && boxModel.model && boxModel.model.content;
+  const center = centerFromQuad(quad);
+  if (!center) {
+    throw new Error(`Failed to get box model for ${ref}`);
+  }
+
+  return {
+    objectId,
+    x: center.x,
+    y: center.y,
+    backendDOMNodeId,
+  };
 }
 
 function dbEval(body) {
@@ -1503,6 +1570,38 @@ commands.snapshot = async function(args, context = {}) {
 
   const output = formatSnapshot(displayNodes);
   console.log(output || '(empty snapshot)');
+};
+
+// neo click @ref [--new-tab]
+commands.click = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const ref = positional[0];
+  if (!ref || positional.length > 1) {
+    console.error('Usage: neo click @ref [--new-tab]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  const modifiers = flags['new-tab'] !== undefined ? 4 : 0;
+  const base = {
+    x: target.x,
+    y: target.y,
+    button: 'left',
+    clickCount: 1,
+  };
+  if (modifiers) base.modifiers = modifiers;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    ...base,
+    type: 'mousePressed',
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    ...base,
+    type: 'mouseReleased',
+  });
+  console.log(`Clicked ${ref}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4047,6 +4146,7 @@ Commands:
   neo discover                            Discover reachable CDP endpoints on localhost
   neo sessions                            List saved active sessions
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+  neo click @ref [--new-tab]              Click element by @ref
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs

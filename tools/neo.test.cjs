@@ -7,10 +7,31 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 let pass = 0, fail = 0;
+const pendingTests = [];
 
 function test(name, fn) {
-  try { fn(); pass++; console.log(`  ✓ ${name}`); }
-  catch (e) { fail++; console.log(`  ✗ ${name}: ${e.message}`); }
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      pendingTests.push(
+        result
+          .then(() => {
+            pass++;
+            console.log(`  ✓ ${name}`);
+          })
+          .catch((e) => {
+            fail++;
+            console.log(`  ✗ ${name}: ${e.message}`);
+          })
+      );
+      return;
+    }
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    fail++;
+    console.log(`  ✗ ${name}: ${e.message}`);
+  }
 }
 
 // ─── Extract functions (copy-paste to keep neo.cjs untouched) ───
@@ -273,6 +294,64 @@ function formatSnapshot(nodes) {
   return rows.join('\n');
 }
 
+function getBackendNodeIdFromRef(session, ref) {
+  const normalizedRef = String(ref || '');
+  if (!normalizedRef.startsWith('@')) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
+    ? refs[normalizedRef].backendDOMNodeId
+    : null;
+  if (!backendDOMNodeId) {
+    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+  }
+  return backendDOMNodeId;
+}
+
+function centerFromQuad(quad) {
+  if (!Array.isArray(quad) || quad.length < 8) return null;
+  const xs = [quad[0], quad[2], quad[4], quad[6]].map(Number).filter(Number.isFinite);
+  const ys = [quad[1], quad[3], quad[5], quad[7]].map(Number).filter(Number.isFinite);
+  if (xs.length !== 4 || ys.length !== 4) return null;
+  const x = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+  const y = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+  return { x, y };
+}
+
+async function resolveRef(sessionName, ref, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : (() => Promise.reject(new Error('Missing cdpSend stub')));
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const backendDOMNodeId = getBackendNodeIdFromRef(session, ref);
+  const resolved = await sendFn(session.pageWsUrl, 'DOM.resolveNode', { backendNodeId: backendDOMNodeId });
+  const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (!objectId) {
+    throw new Error(`Failed to resolve node for ${ref}`);
+  }
+
+  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  const quad = boxModel && boxModel.model && boxModel.model.content;
+  const center = centerFromQuad(quad);
+  if (!center) {
+    throw new Error(`Failed to get box model for ${ref}`);
+  }
+
+  return {
+    objectId,
+    x: center.x,
+    y: center.y,
+    backendDOMNodeId,
+  };
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 console.log('\nisAuthHeader:');
@@ -517,6 +596,60 @@ test('formatSnapshot renders indented lines and escapes quotes', () => {
 test('formatSnapshot ignores invalid nodes and falls back to defaults', () => {
   const text = formatSnapshot([null, { depth: -1, name: 'X' }]);
   assert.strictEqual(text, '@e?  [unknown] "X"');
+});
+
+console.log('\nresolveRef:');
+test('resolveRef returns objectId + center coordinates', async () => {
+  const calls = [];
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {
+        '@e1': { backendDOMNodeId: 1234 },
+      },
+    },
+  };
+  const fakeSend = async (wsUrl, method, params) => {
+    calls.push({ wsUrl, method, params });
+    if (method === 'DOM.resolveNode') {
+      return { object: { objectId: 'obj-1' } };
+    }
+    if (method === 'DOM.getBoxModel') {
+      return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  };
+
+  const result = await resolveRef('ui', '@e1', {
+    getSession: (name) => fakeSession[name] || null,
+    cdpSend: fakeSend,
+  });
+  assert.deepStrictEqual(result, {
+    objectId: 'obj-1',
+    x: 20,
+    y: 30,
+    backendDOMNodeId: 1234,
+  });
+  assert.deepStrictEqual(
+    calls.map(call => call.method),
+    ['DOM.resolveNode', 'DOM.getBoxModel']
+  );
+});
+
+test('resolveRef throws when ref is missing from session refs', async () => {
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {},
+    },
+  };
+  await assert.rejects(
+    resolveRef('ui', '@e9', {
+      getSession: (name) => fakeSession[name] || null,
+      cdpSend: async () => ({}),
+    }),
+    /Unknown ref/
+  );
 });
 
 // ─── Interceptor utils (extracted pure functions) ───────────────
@@ -1152,6 +1285,9 @@ test('getSelector returns #id when present', () => {
   assert.strictEqual(getSelector(el), '#main');
 });
 
-resetSessionFile();
-console.log(`\n${pass} passed, ${fail} failed\n`);
-process.exit(fail > 0 ? 1 : 0);
+Promise.all(pendingTests)
+  .finally(() => {
+    resetSessionFile();
+    console.log(`\n${pass} passed, ${fail} failed\n`);
+    process.exit(fail > 0 ? 1 : 0);
+  });
