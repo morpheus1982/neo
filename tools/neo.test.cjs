@@ -352,6 +352,68 @@ async function resolveRef(sessionName, ref, deps = {}) {
   };
 }
 
+const PRESS_KEY_MAP = {
+  enter: { key: 'Enter', code: 'Enter' },
+  tab: { key: 'Tab', code: 'Tab' },
+  escape: { key: 'Escape', code: 'Escape' },
+  esc: { key: 'Escape', code: 'Escape' },
+  backspace: { key: 'Backspace', code: 'Backspace' },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp' },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown' },
+  arrowleft: { key: 'ArrowLeft', code: 'ArrowLeft' },
+  arrowright: { key: 'ArrowRight', code: 'ArrowRight' },
+  space: { key: ' ', code: 'Space', text: ' ' },
+  delete: { key: 'Delete', code: 'Delete' },
+  home: { key: 'Home', code: 'Home' },
+  end: { key: 'End', code: 'End' },
+  pageup: { key: 'PageUp', code: 'PageUp' },
+  pagedown: { key: 'PageDown', code: 'PageDown' },
+};
+
+function parsePressKey(rawKey) {
+  const input = String(rawKey || '').trim();
+  if (!input) return null;
+
+  const parts = input.split('+').map(part => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const keyPart = parts.pop();
+  const lowerKey = String(keyPart || '').toLowerCase();
+  let mapped = PRESS_KEY_MAP[lowerKey] ? { ...PRESS_KEY_MAP[lowerKey] } : null;
+
+  if (!mapped && /^[a-z]$/i.test(keyPart)) {
+    const char = keyPart.toLowerCase();
+    mapped = { key: char, code: `Key${char.toUpperCase()}` };
+  }
+
+  if (!mapped) return null;
+
+  let modifiers = 0;
+  for (const token of parts) {
+    const lower = token.toLowerCase();
+    if (lower === 'ctrl' || lower === 'control') {
+      modifiers |= 2;
+      continue;
+    }
+    if (lower === 'alt') {
+      modifiers |= 1;
+      continue;
+    }
+    if (lower === 'meta' || lower === 'cmd' || lower === 'command') {
+      modifiers |= 4;
+      continue;
+    }
+    if (lower === 'shift') {
+      modifiers |= 8;
+      continue;
+    }
+    return null;
+  }
+
+  if (modifiers) mapped.modifiers = modifiers;
+  return mapped;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 console.log('\nisAuthHeader:');
@@ -650,6 +712,27 @@ test('resolveRef throws when ref is missing from session refs', async () => {
     }),
     /Unknown ref/
   );
+});
+
+console.log('\npress key mapping:');
+test('maps Enter to CDP key payload', () => {
+  assert.deepStrictEqual(parsePressKey('Enter'), { key: 'Enter', code: 'Enter' });
+});
+
+test('maps ArrowDown to CDP key payload', () => {
+  assert.deepStrictEqual(parsePressKey('ArrowDown'), { key: 'ArrowDown', code: 'ArrowDown' });
+});
+
+test('maps Space with text payload', () => {
+  assert.deepStrictEqual(parsePressKey('Space'), { key: ' ', code: 'Space', text: ' ' });
+});
+
+test('maps Ctrl+a with modifiers=2', () => {
+  assert.deepStrictEqual(parsePressKey('Ctrl+a'), { key: 'a', code: 'KeyA', modifiers: 2 });
+});
+
+test('returns null for unsupported key', () => {
+  assert.strictEqual(parsePressKey('Ctrl+F13'), null);
 });
 
 // ─── Interceptor utils (extracted pure functions) ───────────────

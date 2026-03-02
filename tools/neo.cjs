@@ -25,6 +25,7 @@
 //   neo click @ref [--new-tab]              Click element by @ref
 //   neo fill @ref "text"                     Clear then fill element by @ref
 //   neo type @ref "text"                     Type text without clearing
+//   neo press <key>                          Press keyboard key (supports Ctrl+a)
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -332,6 +333,68 @@ async function resolveRef(sessionName, ref, deps = {}) {
     y: center.y,
     backendDOMNodeId,
   };
+}
+
+const PRESS_KEY_MAP = {
+  enter: { key: 'Enter', code: 'Enter' },
+  tab: { key: 'Tab', code: 'Tab' },
+  escape: { key: 'Escape', code: 'Escape' },
+  esc: { key: 'Escape', code: 'Escape' },
+  backspace: { key: 'Backspace', code: 'Backspace' },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp' },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown' },
+  arrowleft: { key: 'ArrowLeft', code: 'ArrowLeft' },
+  arrowright: { key: 'ArrowRight', code: 'ArrowRight' },
+  space: { key: ' ', code: 'Space', text: ' ' },
+  delete: { key: 'Delete', code: 'Delete' },
+  home: { key: 'Home', code: 'Home' },
+  end: { key: 'End', code: 'End' },
+  pageup: { key: 'PageUp', code: 'PageUp' },
+  pagedown: { key: 'PageDown', code: 'PageDown' },
+};
+
+function parsePressKey(rawKey) {
+  const input = String(rawKey || '').trim();
+  if (!input) return null;
+
+  const parts = input.split('+').map(part => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const keyPart = parts.pop();
+  const lowerKey = String(keyPart || '').toLowerCase();
+  let mapped = PRESS_KEY_MAP[lowerKey] ? { ...PRESS_KEY_MAP[lowerKey] } : null;
+
+  if (!mapped && /^[a-z]$/i.test(keyPart)) {
+    const char = keyPart.toLowerCase();
+    mapped = { key: char, code: `Key${char.toUpperCase()}` };
+  }
+
+  if (!mapped) return null;
+
+  let modifiers = 0;
+  for (const token of parts) {
+    const lower = token.toLowerCase();
+    if (lower === 'ctrl' || lower === 'control') {
+      modifiers |= 2;
+      continue;
+    }
+    if (lower === 'alt') {
+      modifiers |= 1;
+      continue;
+    }
+    if (lower === 'meta' || lower === 'cmd' || lower === 'command') {
+      modifiers |= 4;
+      continue;
+    }
+    if (lower === 'shift') {
+      modifiers |= 8;
+      continue;
+    }
+    return null;
+  }
+
+  if (modifiers) mapped.modifiers = modifiers;
+  return mapped;
 }
 
 function dbEval(body) {
@@ -1667,6 +1730,44 @@ commands.type = async function(args, context = {}) {
   });
   await cdpSend(pageWsUrl, 'Input.insertText', { text });
   console.log(`Typed into ${ref}`);
+};
+
+// neo press <key>
+commands.press = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const rawKey = positional[0];
+  if (!rawKey || positional.length > 1) {
+    console.error('Usage: neo press <key>');
+    process.exit(1);
+  }
+
+  const mapped = parsePressKey(rawKey);
+  if (!mapped) {
+    console.error(`Unsupported key: ${rawKey}`);
+    console.error('Supported: Enter, Tab, Escape, Backspace, ArrowUp/Down/Left/Right, Space, Delete, Home, End, PageUp, PageDown, Ctrl+a');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const down = {
+    type: 'keyDown',
+    key: mapped.key,
+    code: mapped.code,
+  };
+  if (mapped.modifiers) down.modifiers = mapped.modifiers;
+  if (mapped.text !== undefined) down.text = mapped.text;
+
+  const up = {
+    type: 'keyUp',
+    key: mapped.key,
+    code: mapped.code,
+  };
+  if (mapped.modifiers) up.modifiers = mapped.modifiers;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', down);
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', up);
+  console.log(`Pressed ${rawKey}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4214,6 +4315,7 @@ Commands:
   neo click @ref [--new-tab]              Click element by @ref
   neo fill @ref "text"                     Clear then fill element by @ref
   neo type @ref "text"                     Type text without clearing
+  neo press <key>                          Press keyboard key (supports Ctrl+a)
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
