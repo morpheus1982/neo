@@ -3,6 +3,9 @@
 // Run: node tools/neo.test.cjs
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 let pass = 0, fail = 0;
 
 function test(name, fn) {
@@ -21,6 +24,8 @@ const AUTH_HEADER_PATTERNS = [
 
 const REDACTED_HEADER_VALUE = '[REDACTED]';
 const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+const SESSION_FILE = path.join(os.tmpdir(), `neo-sessions-test-${process.pid}.json`);
+const DEFAULT_SESSION_NAME = '__default__';
 
 function isAuthHeader(name) {
   const lk = String(name || '').toLowerCase();
@@ -104,17 +109,89 @@ function parseDuration(str) {
 function parseArgs(argv) {
   const positional = [];
   const flags = {};
+  let sessionName = DEFAULT_SESSION_NAME;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
+    const current = argv[i];
+    if (current.startsWith('--')) {
+      const eqIndex = current.indexOf('=');
+      const hasInlineValue = eqIndex > 2;
+      const key = hasInlineValue ? current.slice(2, eqIndex) : current.slice(2);
+      const inlineValue = hasInlineValue ? current.slice(eqIndex + 1) : null;
       const next = argv[i + 1];
-      if (next && !next.startsWith('--')) { flags[key] = next; i++; }
-      else { flags[key] = true; }
+      if (key === 'session') {
+        if (hasInlineValue) {
+          sessionName = inlineValue || DEFAULT_SESSION_NAME;
+        } else if (next && !next.startsWith('--')) {
+          sessionName = next;
+          i++;
+        } else {
+          sessionName = DEFAULT_SESSION_NAME;
+        }
+        continue;
+      }
+      if (hasInlineValue) {
+        flags[key] = inlineValue;
+      } else if (next && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
     } else {
-      positional.push(argv[i]);
+      positional.push(current);
     }
   }
-  return { positional, flags };
+  return { positional, flags, sessionName };
+}
+
+function stripGlobalSessionFlag(argv) {
+  const clean = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--session') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) i++;
+      continue;
+    }
+    if (arg.startsWith('--session=')) continue;
+    clean.push(arg);
+  }
+  return clean;
+}
+
+function loadSessions() {
+  if (!fs.existsSync(SESSION_FILE)) return {};
+  try {
+    const raw = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  const safeSessions = (!sessions || typeof sessions !== 'object' || Array.isArray(sessions))
+    ? {}
+    : sessions;
+  fs.writeFileSync(SESSION_FILE, `${JSON.stringify(safeSessions, null, 2)}\n`, 'utf8');
+}
+
+function getSession(name = DEFAULT_SESSION_NAME) {
+  const sessions = loadSessions();
+  return sessions[name] || null;
+}
+
+function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
+  const sessions = loadSessions();
+  sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
+  saveSessions(sessions);
+  return sessions[name];
+}
+
+function resetSessionFile() {
+  try { fs.unlinkSync(SESSION_FILE); } catch {}
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -234,6 +311,62 @@ test('mixed positional and flags', () => {
   const r = parseArgs(['capture', 'list', '--limit', '5', 'github.com']);
   assert.deepStrictEqual(r.positional, ['capture', 'list', 'github.com']);
   assert.strictEqual(r.flags.limit, '5');
+});
+test('supports global --session with separated value', () => {
+  const r = parseArgs(['--session', 'team-a', 'connect', '9225']);
+  assert.strictEqual(r.sessionName, 'team-a');
+  assert.deepStrictEqual(r.positional, ['connect', '9225']);
+});
+test('supports global --session with inline value', () => {
+  const r = parseArgs(['--session=team-b', 'discover']);
+  assert.strictEqual(r.sessionName, 'team-b');
+  assert.deepStrictEqual(r.positional, ['discover']);
+});
+test('stripGlobalSessionFlag removes session arguments only', () => {
+  const cleaned = stripGlobalSessionFlag(['--session', 'dev', 'connect', '--json', '9222']);
+  assert.deepStrictEqual(cleaned, ['connect', '--json', '9222']);
+});
+
+console.log('\nsession store:');
+test('loadSessions returns empty object when session file is missing', () => {
+  resetSessionFile();
+  assert.deepStrictEqual(loadSessions(), {});
+});
+test('saveSessions and loadSessions keep object payload', () => {
+  resetSessionFile();
+  saveSessions({ a: { cdpUrl: 'http://localhost:9222' } });
+  assert.deepStrictEqual(loadSessions(), { a: { cdpUrl: 'http://localhost:9222' } });
+});
+test('setSession writes default session when name is omitted', () => {
+  resetSessionFile();
+  const payload = {
+    cdpUrl: 'http://localhost:9222',
+    pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+    tabId: 'tab-1',
+    refs: {},
+  };
+  setSession(undefined, payload);
+  const sessions = loadSessions();
+  assert.deepStrictEqual(sessions[DEFAULT_SESSION_NAME], payload);
+});
+test('setSession keeps existing sessions and getSession resolves by name', () => {
+  resetSessionFile();
+  setSession('alpha', { cdpUrl: 'http://localhost:9222', refs: {} });
+  setSession('beta', { cdpUrl: 'http://localhost:9223', refs: {} });
+  const alpha = getSession('alpha');
+  const beta = getSession('beta');
+  assert.strictEqual(alpha.cdpUrl, 'http://localhost:9222');
+  assert.strictEqual(beta.cdpUrl, 'http://localhost:9223');
+});
+test('getSession returns null for unknown session name', () => {
+  resetSessionFile();
+  saveSessions({ alpha: { cdpUrl: 'http://localhost:9222' } });
+  assert.strictEqual(getSession('missing'), null);
+});
+test('saveSessions normalizes invalid input to empty object', () => {
+  resetSessionFile();
+  saveSessions(null);
+  assert.deepStrictEqual(loadSessions(), {});
 });
 
 // ─── Interceptor utils (extracted pure functions) ───────────────
@@ -853,6 +986,7 @@ test('parseArgs handles empty array', () => {
   const r = parseArgs([]);
   assert.deepStrictEqual(r.positional, []);
   assert.deepStrictEqual(r.flags, {});
+  assert.strictEqual(r.sessionName, DEFAULT_SESSION_NAME);
 });
 test('getCaptureKey normalizes method+url', () => {
   const k1 = getCaptureKey('GET', '/api/test', 'http://example.com');
@@ -868,5 +1002,6 @@ test('getSelector returns #id when present', () => {
   assert.strictEqual(getSelector(el), '#main');
 });
 
+resetSessionFile();
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail > 0 ? 1 : 0);
