@@ -47,6 +47,15 @@ const REDACTED_HEADER_VALUE = '[REDACTED]';
 const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
 const SESSION_FILE = path.join(os.tmpdir(), `neo-sessions-test-${process.pid}.json`);
 const DEFAULT_SESSION_NAME = '__default__';
+const ELECTRON_APPS = Object.freeze({
+  slack: Object.freeze(['/usr/bin/slack', 'slack']),
+  code: Object.freeze(['/usr/bin/code', 'code']),
+  vscode: Object.freeze(['/usr/bin/code', 'code']),
+  discord: Object.freeze(['/usr/bin/discord', 'discord']),
+  notion: Object.freeze(['/usr/bin/notion', 'notion']),
+  figma: Object.freeze([]),
+  feishu: Object.freeze(['/opt/bytedance/feishu/feishu', 'feishu']),
+});
 
 function isAuthHeader(name) {
   const lk = String(name || '').toLowerCase();
@@ -209,6 +218,52 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
   saveSessions(sessions);
   return sessions[name];
+}
+
+function normalizeElectronAppName(appName) {
+  const normalized = String(appName || '').trim().toLowerCase();
+  if (normalized === 'vscode') return 'code';
+  return normalized;
+}
+
+function resolveElectronExecutable(appName, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const commandExistsFn = typeof deps.commandExists === 'function' ? deps.commandExists : () => false;
+  const normalizedName = normalizeElectronAppName(appName);
+  if (!normalizedName || !Object.prototype.hasOwnProperty.call(ELECTRON_APPS, normalizedName)) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unknown-app',
+      candidates: [],
+    };
+  }
+  const candidates = Array.isArray(ELECTRON_APPS[normalizedName]) ? ELECTRON_APPS[normalizedName] : [];
+  if (!candidates.length) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unsupported-on-linux',
+      candidates,
+    };
+  }
+  for (const candidate of candidates) {
+    if (candidate.includes('/')) {
+      if (existsSyncFn(candidate)) {
+        return { app: normalizedName, executable: candidate, error: null, candidates };
+      }
+      continue;
+    }
+    if (commandExistsFn(candidate)) {
+      return { app: normalizedName, executable: candidate, error: null, candidates };
+    }
+  }
+  return {
+    app: normalizedName,
+    executable: null,
+    error: 'executable-not-found',
+    candidates,
+  };
 }
 
 function resetSessionFile() {
@@ -545,6 +600,49 @@ test('supports global --session with inline value', () => {
 test('stripGlobalSessionFlag removes session arguments only', () => {
   const cleaned = stripGlobalSessionFlag(['--session', 'dev', 'connect', '--json', '9222']);
   assert.deepStrictEqual(cleaned, ['connect', '--json', '9222']);
+});
+
+console.log('\nElectron app mapping:');
+test('ELECTRON_APPS includes expected Linux candidates', () => {
+  assert.deepStrictEqual(ELECTRON_APPS.slack, ['/usr/bin/slack', 'slack']);
+  assert.deepStrictEqual(ELECTRON_APPS.code, ['/usr/bin/code', 'code']);
+  assert.deepStrictEqual(ELECTRON_APPS.vscode, ['/usr/bin/code', 'code']);
+  assert.deepStrictEqual(ELECTRON_APPS.discord, ['/usr/bin/discord', 'discord']);
+  assert.deepStrictEqual(ELECTRON_APPS.notion, ['/usr/bin/notion', 'notion']);
+  assert.deepStrictEqual(ELECTRON_APPS.feishu, ['/opt/bytedance/feishu/feishu', 'feishu']);
+  assert.deepStrictEqual(ELECTRON_APPS.figma, []);
+});
+
+test('normalizeElectronAppName maps vscode to code', () => {
+  assert.strictEqual(normalizeElectronAppName('vscode'), 'code');
+  assert.strictEqual(normalizeElectronAppName('code'), 'code');
+});
+
+test('resolveElectronExecutable prefers existing absolute paths', () => {
+  const out = resolveElectronExecutable('slack', {
+    existsSync: (p) => p === '/usr/bin/slack',
+    commandExists: () => false,
+  });
+  assert.strictEqual(out.executable, '/usr/bin/slack');
+  assert.strictEqual(out.error, null);
+});
+
+test('resolveElectronExecutable falls back to command lookup', () => {
+  const out = resolveElectronExecutable('feishu', {
+    existsSync: () => false,
+    commandExists: (name) => name === 'feishu',
+  });
+  assert.strictEqual(out.executable, 'feishu');
+  assert.strictEqual(out.error, null);
+});
+
+test('resolveElectronExecutable reports unsupported app', () => {
+  const out = resolveElectronExecutable('figma', {
+    existsSync: () => false,
+    commandExists: () => false,
+  });
+  assert.strictEqual(out.executable, null);
+  assert.strictEqual(out.error, 'unsupported-on-linux');
 });
 
 console.log('\nsession store:');

@@ -18,6 +18,7 @@
 //   neo open <url>                          Open URL in Chrome
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
+//   neo launch <app> [--port N]             Launch Electron app with CDP enabled
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo sessions                            List saved active sessions
@@ -41,6 +42,7 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const { spawn, execSync } = require('child_process');
 
 const CDP_URL = process.env.NEO_CDP_URL || 'http://localhost:9222';
 const DB_NAME = 'neo-capture-v01';
@@ -50,6 +52,15 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const DEFAULT_SESSION_NAME = '__default__';
+const ELECTRON_APPS = Object.freeze({
+  slack: Object.freeze(['/usr/bin/slack', 'slack']),
+  code: Object.freeze(['/usr/bin/code', 'code']),
+  vscode: Object.freeze(['/usr/bin/code', 'code']),
+  discord: Object.freeze(['/usr/bin/discord', 'discord']),
+  notion: Object.freeze(['/usr/bin/notion', 'notion']),
+  figma: Object.freeze([]),
+  feishu: Object.freeze(['/opt/bytedance/feishu/feishu', 'feishu']),
+});
 const INTERACTIVE_ROLES = new Set([
   'button', 'textbox', 'link', 'combobox', 'checkbox', 'menuitem', 'tab',
   'radio', 'slider', 'switch', 'searchbox', 'spinbutton', 'option',
@@ -86,6 +97,87 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
   saveSessions(sessions);
   return sessions[name];
+}
+
+function shellEscape(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function commandExists(commandName) {
+  const name = String(commandName || '').trim();
+  if (!name || name.includes('/')) return false;
+  try {
+    execSync(`command -v ${shellEscape(name)}`, { stdio: 'ignore', shell: '/bin/sh' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeElectronAppName(appName) {
+  const normalized = String(appName || '').trim().toLowerCase();
+  if (normalized === 'vscode') return 'code';
+  return normalized;
+}
+
+function resolveElectronExecutable(appName, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const commandExistsFn = typeof deps.commandExists === 'function' ? deps.commandExists : commandExists;
+  const normalizedName = normalizeElectronAppName(appName);
+  if (!normalizedName || !Object.prototype.hasOwnProperty.call(ELECTRON_APPS, normalizedName)) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unknown-app',
+      candidates: [],
+    };
+  }
+  const candidates = Array.isArray(ELECTRON_APPS[normalizedName]) ? ELECTRON_APPS[normalizedName] : [];
+  if (!candidates.length) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unsupported-on-linux',
+      candidates,
+    };
+  }
+  for (const candidate of candidates) {
+    if (candidate.includes('/')) {
+      if (existsSyncFn(candidate)) {
+        return { app: normalizedName, executable: candidate, error: null, candidates };
+      }
+      continue;
+    }
+    if (commandExistsFn(candidate)) {
+      return { app: normalizedName, executable: candidate, error: null, candidates };
+    }
+  }
+  return {
+    app: normalizedName,
+    executable: null,
+    error: 'executable-not-found',
+    candidates,
+  };
+}
+
+async function waitForCdpPort(port, timeoutMs = 10000, intervalMs = 250, deps = {}) {
+  const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
+  const sleepFn = typeof deps.sleep === 'function' ? deps.sleep : sleep;
+  const nowFn = typeof deps.now === 'function' ? deps.now : Date.now;
+  const target = `http://localhost:${port}/json/version`;
+  const deadline = nowFn() + timeoutMs;
+
+  while (nowFn() <= deadline) {
+    try {
+      const resp = await fetchFn(target);
+      if (resp && resp.ok) {
+        return true;
+      }
+    } catch {}
+    if (nowFn() >= deadline) break;
+    await sleepFn(intervalMs);
+  }
+  return false;
 }
 
 // ─── CDP Helpers ────────────────────────────────────────────────
@@ -1583,6 +1675,48 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+// neo launch <app> [--port N]
+commands.launch = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  const rawApp = positional[0];
+  const rawPort = flags.port === undefined ? '9222' : String(flags.port);
+  const port = parseInt(rawPort, 10);
+  if (!rawApp || positional.length > 1 || flags.port === true || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    console.error('Usage: neo launch <app> [--port N]');
+    process.exit(1);
+  }
+
+  const resolved = resolveElectronExecutable(rawApp);
+  if (resolved.error === 'unknown-app') {
+    console.error(`Unknown app: ${rawApp}`);
+    console.error(`Supported apps: ${Object.keys(ELECTRON_APPS).join(', ')}`);
+    process.exit(1);
+  }
+  if (resolved.error === 'unsupported-on-linux') {
+    console.error(`${normalizeElectronAppName(rawApp)}: no native Linux client`);
+    process.exit(1);
+  }
+  if (!resolved.executable) {
+    console.error(`Cannot find executable for ${normalizeElectronAppName(rawApp)}.`);
+    console.error(`Tried: ${resolved.candidates.join(', ')}`);
+    process.exit(1);
+  }
+
+  const spawnArgs = [`--remote-debugging-port=${port}`];
+  const child = spawn(resolved.executable, spawnArgs, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const ready = await waitForCdpPort(port, 10000, 250);
+  if (!ready) {
+    throw new Error(`Launched ${normalizeElectronAppName(rawApp)} but CDP endpoint on port ${port} was not ready within 10s`);
+  }
+
+  console.log(`Launched ${normalizeElectronAppName(rawApp)} on port ${port}`);
 };
 
 // neo connect [port]
@@ -4646,6 +4780,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo launch <app> [--port N]             Launch Electron app with CDP enabled
   neo connect [port]                      Connect to CDP and save active session
   neo discover                            Discover reachable CDP endpoints on localhost
   neo sessions                            List saved active sessions
