@@ -20,6 +20,7 @@
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo discover                            Discover reachable CDP targets on localhost ports
+//   neo sessions                            List saved active sessions
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1200,6 +1201,29 @@ commands.discover = async function() {
       console.log(`  ${tabId} ${title}`);
       console.log(`    ${page.url || '(no-url)'}`);
     }
+  }
+};
+
+// neo sessions
+commands.sessions = function() {
+  const sessions = loadSessions();
+  const active = Object.entries(sessions)
+    .filter(([, value]) => value && typeof value === 'object' && value.cdpUrl);
+
+  if (!active.length) {
+    console.log('No active sessions');
+    return;
+  }
+
+  active.sort(([nameA], [nameB]) => {
+    if (nameA === DEFAULT_SESSION_NAME && nameB !== DEFAULT_SESSION_NAME) return -1;
+    if (nameB === DEFAULT_SESSION_NAME && nameA !== DEFAULT_SESSION_NAME) return 1;
+    return nameA.localeCompare(nameB);
+  });
+
+  for (const [name, data] of active) {
+    const tab = data.tabId || '(no-tab)';
+    console.log(`${name} ${data.cdpUrl} ${tab}`);
   }
 };
 
@@ -3739,6 +3763,7 @@ Commands:
   neo read <tab-pattern>                  Extract readable text from page
   neo connect [port]                      Connect to CDP and save active session
   neo discover                            Discover reachable CDP endpoints on localhost
+  neo sessions                            List saved active sessions
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
