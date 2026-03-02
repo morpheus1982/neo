@@ -27,6 +27,7 @@
 //   neo type @ref "text"                     Type text without clearing
 //   neo press <key>                          Press keyboard key (supports Ctrl+a)
 //   neo hover @ref                           Hover over element by @ref
+//   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -396,6 +397,37 @@ function parsePressKey(rawKey) {
 
   if (modifiers) mapped.modifiers = modifiers;
   return mapped;
+}
+
+async function resolveScrollPoint(pageWsUrl, selector) {
+  const expression = `(function() {
+    try {
+      var el = ${selector ? `document.querySelector(${JSON.stringify(selector)})` : 'null'};
+      if (el) {
+        var rect = el.getBoundingClientRect();
+        return {
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2)
+        };
+      }
+    } catch (e) {}
+    return {
+      x: Math.round(window.innerWidth / 2),
+      y: Math.round(window.innerHeight / 2)
+    };
+  })()`;
+  const result = await cdpSend(pageWsUrl, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  });
+  const value = result && result.result && result.result.value;
+  if (!value || !Number.isFinite(value.x) || !Number.isFinite(value.y)) {
+    return { x: 0, y: 0 };
+  }
+  return {
+    x: Number(value.x),
+    y: Number(value.y),
+  };
 }
 
 function dbEval(body) {
@@ -1789,6 +1821,37 @@ commands.hover = async function(args, context = {}) {
     y: target.y,
   });
   console.log(`Hovered ${ref}`);
+};
+
+// neo scroll <up|down|left|right> [px] [--selector css]
+commands.scroll = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const direction = String(positional[0] || '').toLowerCase();
+  const rawDistance = positional[1];
+  const distance = rawDistance ? parseInt(rawDistance, 10) : 300;
+  const selector = flags.selector || null;
+  if (flags.selector === true || !direction || !['up', 'down', 'left', 'right'].includes(direction) || (rawDistance && (!Number.isInteger(distance) || distance <= 0))) {
+    console.error('Usage: neo scroll <up|down|left|right> [px] [--selector css]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const point = await resolveScrollPoint(pageWsUrl, selector);
+  const wheel = {
+    type: 'mouseWheel',
+    x: point.x,
+    y: point.y,
+    deltaX: 0,
+    deltaY: 0,
+  };
+  if (direction === 'up') wheel.deltaY = -distance;
+  if (direction === 'down') wheel.deltaY = distance;
+  if (direction === 'left') wheel.deltaX = -distance;
+  if (direction === 'right') wheel.deltaX = distance;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', wheel);
+  console.log(`Scrolled ${direction} ${distance}px`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4338,6 +4401,7 @@ Commands:
   neo type @ref "text"                     Type text without clearing
   neo press <key>                          Press keyboard key (supports Ctrl+a)
   neo hover @ref                           Hover over element by @ref
+  neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
