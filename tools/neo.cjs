@@ -28,6 +28,7 @@
 //   neo press <key>                          Press keyboard key (supports Ctrl+a)
 //   neo hover @ref                           Hover over element by @ref
 //   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
+//   neo select @ref "value"                  Select option value by @ref
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1852,6 +1853,45 @@ commands.scroll = async function(args, context = {}) {
 
   await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', wheel);
   console.log(`Scrolled ${direction} ${distance}px`);
+};
+
+// neo select @ref "value"
+commands.select = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const value = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || value === null) {
+    console.error('Usage: neo select @ref "value"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+    objectId: target.objectId,
+    functionDeclaration: `function(nextValue) {
+      if (!this) return { ok: false, error: 'missing element' };
+      if (!('value' in this)) return { ok: false, error: 'element has no value property' };
+      if (typeof this.focus === 'function') this.focus();
+      this.value = nextValue;
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, value: this.value };
+    }`,
+    arguments: [{ value }],
+    returnByValue: true,
+  });
+
+  if (result && result.exceptionDetails) {
+    throw new Error(`Failed to select value for ${ref}`);
+  }
+  const payload = result && result.result && result.result.value;
+  if (!payload || payload.ok !== true) {
+    throw new Error(payload && payload.error ? payload.error : `Failed to select value for ${ref}`);
+  }
+
+  console.log(`Selected ${ref} = "${payload.value}"`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4402,6 +4442,7 @@ Commands:
   neo press <key>                          Press keyboard key (supports Ctrl+a)
   neo hover @ref                           Hover over element by @ref
   neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
+  neo select @ref "value"                  Select option value by @ref
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
