@@ -24,6 +24,7 @@
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
 //   neo click @ref [--new-tab]              Click element by @ref
 //   neo fill @ref "text"                     Clear then fill element by @ref
+//   neo type @ref "text"                     Type text without clearing
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1646,6 +1647,26 @@ commands.fill = async function(args, context = {}) {
   });
   await cdpSend(pageWsUrl, 'Input.insertText', { text });
   console.log(`Filled ${ref}`);
+};
+
+// neo type @ref "text"
+commands.type = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || text === null) {
+    console.error('Usage: neo type @ref "text"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  await cdpSend(pageWsUrl, 'DOM.focus', {
+    backendNodeId: target.backendDOMNodeId,
+  });
+  await cdpSend(pageWsUrl, 'Input.insertText', { text });
+  console.log(`Typed into ${ref}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4192,6 +4213,7 @@ Commands:
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
   neo click @ref [--new-tab]              Click element by @ref
   neo fill @ref "text"                     Clear then fill element by @ref
+  neo type @ref "text"                     Type text without clearing
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
