@@ -1107,17 +1107,53 @@ function loadDependencyData(wsUrl, domain) {
 function parseArgs(argv) {
   const positional = [];
   const flags = {};
+  let sessionName = DEFAULT_SESSION_NAME;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
+    const current = argv[i];
+    if (current.startsWith('--')) {
+      const eqIndex = current.indexOf('=');
+      const hasInlineValue = eqIndex > 2;
+      const key = hasInlineValue ? current.slice(2, eqIndex) : current.slice(2);
+      const inlineValue = hasInlineValue ? current.slice(eqIndex + 1) : null;
       const next = argv[i + 1];
-      if (next && !next.startsWith('--')) { flags[key] = next; i++; }
-      else { flags[key] = true; }
+      if (key === 'session') {
+        if (hasInlineValue) {
+          sessionName = inlineValue || DEFAULT_SESSION_NAME;
+        } else if (next && !next.startsWith('--')) {
+          sessionName = next;
+          i++;
+        } else {
+          sessionName = DEFAULT_SESSION_NAME;
+        }
+        continue;
+      }
+      if (hasInlineValue) {
+        flags[key] = inlineValue;
+      } else if (next && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
     } else {
-      positional.push(argv[i]);
+      positional.push(current);
     }
   }
-  return { positional, flags };
+  return { positional, flags, sessionName };
+}
+
+function stripGlobalSessionFlag(argv) {
+  const clean = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--session') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) i++;
+      continue;
+    }
+    if (arg.startsWith('--session=')) continue;
+    clean.push(arg);
+  }
+  return clean;
 }
 
 // ─── Commands ───────────────────────────────────────────────────
@@ -3744,10 +3780,14 @@ commands.doctor = async function() {
 };
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  const rawArgv = process.argv.slice(2);
+  const parsed = parseArgs(rawArgv);
+  const sessionName = parsed.sessionName || DEFAULT_SESSION_NAME;
+  const cleanArgv = stripGlobalSessionFlag(rawArgv);
+  const [cmd, ...args] = cleanArgv;
 
   if (commands[cmd]) {
-    await commands[cmd](args);
+    await commands[cmd](args, { sessionName });
   } else {
     console.log(`Neo — Turn any web app into an API
 
@@ -3783,6 +3823,7 @@ Options (for exec):
   --body '{"key": "value"}'              Request body
   --tab <pattern>                         Match tab by URL pattern
   --auto-headers                          Auto-detect auth headers from live browser traffic
+  --session <name>                        Global session name (default: __default__)
 
 Environment:
   NEO_CDP_URL        Chrome DevTools URL (default: http://localhost:9222)
