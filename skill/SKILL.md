@@ -1,159 +1,227 @@
 ---
 name: neo
-description: Turn any web app into an AI-callable tool. Chrome extension passively captures APIs (fetch, XHR, WebSocket, SSE) with DOM trigger correlation. CLI to query, replay, and execute captured APIs with automatic authentication. Use when interacting with websites, discovering APIs, or replacing slow browser-use with direct API calls.
+description: >
+  Browse websites, read web pages, interact with web apps, call website APIs, and automate web tasks.
+  Use Neo when: user asks to check a website, read a web page, post on social media (Twitter/X),
+  interact with any web app, look up information on a specific site, scrape data from websites,
+  automate browser tasks, or when you need to call any website's API.
+  Keywords: website, web page, browse, URL, http, API, twitter, tweet, post, scrape, web app,
+  open site, check site, read page, social media, online service.
+metadata:
+  openclaw:
+    requires:
+      bins: [neo]
+    install:
+      - id: neo
+        kind: node
+        package: "@4ier/neo"
+        bins: [neo]
+        label: "Install Neo CLI (npm)"
 ---
 
 # Neo — Web App API Discovery & Execution
 
-## What
-Chrome extension that passively captures web app APIs + CLI to query/execute them.
-Captures fetch, XHR, WebSocket, and EventSource/SSE traffic with DOM trigger correlation.
+Neo turns any website into an AI-callable API. It passively captures browser traffic, generates API schemas, and lets you call discovered APIs directly — no scraping, no reverse engineering.
 
-## When to use
-- Before browser-use: check if Neo has API knowledge for the domain
-- User asks to interact with any website (GitHub, X, SaaS)
-- User asks what APIs a website uses
-- Replaying or debugging API calls
-
-## CLI
-
-Run from the repo root: `node tools/neo.cjs <command>`
-
-Below, `neo` is shorthand for `node tools/neo.cjs` (add an alias or symlink for convenience).
+## First-Time Setup
 
 ```bash
-# Overview
-neo status                              # Domains + capture counts
+# Install CLI
+npm i -g @4ier/neo
 
-# Capture management
-neo capture summary                     # Quick overview (best for AI agents)
-neo capture list [domain] [--limit N] [--since 1h]  # Recent captures (shows IDs)
-neo capture search <query> [--method POST] [--status 200] [--limit N]
-                                        # Search by URL pattern
-neo capture count                       # Total count
+# One-time setup: detects Chrome, installs extension, configures profile
+neo setup
+
+# Start Chrome with Neo extension
+neo start
+
+# Verify everything works
+neo doctor
+```
+
+All 6 checks should be ✓. If not, run `neo setup` again.
+
+## Prerequisites: Browser with CDP
+
+Neo requires Chrome running with Chrome DevTools Protocol (CDP) enabled.
+
+```bash
+# Check connection
+neo doctor
+
+# If Chrome isn't running with CDP:
+neo start
+
+# Or start manually with your own profile:
+# google-chrome-stable --remote-debugging-port=9222 &
+```
+
+**Environment variables** (all optional):
+- `NEO_CDP_URL` — CDP endpoint (default: `http://localhost:9222`)
+- `NEO_EXTENSION_ID` — Force specific extension ID (default: auto-discovered)
+- `NEO_SCHEMA_DIR` — Schema storage directory (default: `~/.neo/schemas`)
+
+## Complete Workflow
+
+### Step 1: Check what Neo already knows
+
+```bash
+neo status                    # Overview: domains, capture counts, extension status
+neo schema list               # Cached API schemas (knowledge from past browsing)
+```
+
+### Step 2: Open target website (if needed)
+
+```bash
+neo open https://example.com  # Opens in Chrome
+```
+
+### Step 3: Read page content
+
+```bash
+neo read example.com          # Extract readable text from the page (like reader mode)
+```
+
+### Step 4: Interact via API (fast path)
+
+```bash
+# Check if we have API knowledge for this domain
+neo schema show x.com
+
+# Smart API call: auto-finds endpoint + auth
+neo api x.com HomeTimeline
+neo api x.com CreateTweet --body '{"variables":{"tweet_text":"hello"}}'
+neo api github.com notifications
+```
+
+### Step 5: Execute in page context
+
+```bash
+neo exec <url> --method POST --body '{}' --tab example.com --auto-headers
+neo replay <capture-id> --tab example.com
+neo eval "document.title" --tab example.com
+```
+
+### Step 6: UI automation (when no API exists)
+
+```bash
+neo snapshot                  # Get accessibility tree with @ref mapping
+neo click @14                 # Click element by reference
+neo fill @7 "search query"    # Fill input field
+neo type @7 "text"            # Append text
+neo press Enter               # Keyboard input
+neo scroll down 500           # Scroll
+neo screenshot                # Capture screenshot
+```
+
+### Step 7: Clean up — ALWAYS close tabs when done
+
+```bash
+neo tabs                                        # List open tabs
+neo eval "window.close()" --tab example.com     # Close tab
+```
+
+**⚠️ Resource management**: Every `neo open` creates a new tab. Always close tabs after you're done.
+
+## API Discovery Workflow
+
+When you need to discover what APIs a website uses:
+
+```bash
+# 1. Open the site, browse around to generate captures
+neo open https://example.com
+
+# 2. Check accumulated captures
+neo capture list example.com --limit 20
+neo capture search "api" --limit 10
+
+# 3. Generate API schema
+neo schema generate example.com
+
+# 4. Explore the schema
+neo schema show example.com
+
+# 5. Call discovered APIs
+neo api example.com <endpoint-keyword>
+```
+
+## Command Reference
+
+```bash
+# --- Page Reading & Interaction ---
+neo open <url>                          # Open URL in Chrome (creates new tab!)
+neo read <tab-pattern>                  # Extract readable text from page
+neo eval "<js>" --tab <pattern>         # Run JS in page context
+neo tabs [filter]                       # List open Chrome tabs
+
+# --- UI Automation ---
+neo snapshot [-i] [-C] [--json]         # A11y tree with @ref mapping
+neo click @ref [--new-tab]              # Click element
+neo fill @ref "text"                    # Clear + fill input
+neo type @ref "text"                    # Append text to input
+neo press <key>                         # Keyboard key (Ctrl+a, Enter, etc.)
+neo hover @ref                          # Hover
+neo scroll <dir> [px] [--selector css]  # Scroll
+neo select @ref "value"                 # Select dropdown
+neo screenshot [path] [--full]          # Capture screenshot
+neo get text @ref | url | title         # Extract info
+neo wait @ref | --load | <ms>           # Wait for element/load/time
+
+# --- Capture & Traffic ---
+neo status                              # Overview
+neo capture list [domain] [--limit N]   # Recent captures
+neo capture search <query>              # Search by URL pattern
 neo capture domains                     # Domains with counts
 neo capture detail <id>                 # Full capture details
-neo capture stats <domain>              # Method/status/timing breakdown
-neo capture watch [domain]              # Live tail (like tail -f)
-neo capture clear [domain]              # Clear captures
-neo capture export [domain] [--since 1h] [--format har]  # Export as JSON or HAR 1.2
-neo capture import <file>               # Import from JSON (cross-device)
-neo capture prune [--older-than 7d]     # Delete old captures
-neo capture gc [domain] [--dry-run]     # Smart dedup: keep one per unique pattern
+neo capture stats <domain>              # Statistics breakdown
 
-# Schema (API knowledge base)
-neo schema generate <domain>            # Generate + save schema (with diff + versioning)
-neo schema generate --all               # Batch generate for all domains with captures
-neo schema show <domain>                # Human-readable with triggers
-neo schema show <domain> --json         # Raw JSON
-neo schema list                         # All known schemas (with versions)
-neo schema search <query>               # Search all schemas by endpoint/path
-neo schema coverage                     # Show schema vs capture coverage
-neo schema openapi <domain>             # Export as OpenAPI 3.0 spec
+# --- Schema (API Knowledge) ---
+neo schema generate <domain>            # Generate from captures
+neo schema show <domain>                # Human-readable
+neo schema list                         # All cached schemas
+neo schema search <query>               # Search endpoints
+neo schema openapi <domain>             # Export OpenAPI 3.0
 
-# Execute
-neo exec <url> [--method POST] [--header "K:V"] [--body "{}"] [--tab pattern] [--auto-headers]
-                                        # Execute fetch in browser (auto auth)
-neo api <domain> <search-term> [--body '{}']  # Smart API call: schema lookup + auto-auth + auto-tab
-neo replay <id> [--tab pattern]         # Replay a captured API call
+# --- API Execution ---
+neo api <domain> <keyword> [--body '{}']  # Smart call (schema + auto-auth)
+neo exec <url> [--method POST] [--body] [--tab pattern] [--auto-headers]
+neo replay <id> [--tab pattern]         # Replay captured call
 
-# Analyze
-neo flows <domain> [--window <ms>] [--min-count <n>]
-                                        # Discover API call sequence patterns
-neo deps <domain> [--window <ms>] [--min-confidence <n>]
-                                        # Discover API dependency chains (response→request data flow)
-neo label <domain> [--dry-run]         # Add semantic labels to schema endpoints
-neo workflow discover <domain>           # Discover reusable multi-step workflows
-neo workflow show <name>                # Show workflow definition and transitions
-neo workflow run <name> [--params k=v]  # Execute workflow step-by-step
+# --- Analysis ---
+neo flows <domain>                      # API call sequence patterns
+neo deps <domain>                       # Data flow dependencies
+neo suggest <domain>                    # AI capability analysis
 
-# Page interaction
-neo eval "<js>" --tab <pattern>         # Run JS in page context
-neo open <url>                          # Open URL in Chrome
-neo read <tab-pattern>                  # Extract readable page text
-
-# Diagnostics
-neo doctor                              # Check Chrome, extension, schemas, bridge
-neo reload                              # Reload the Neo extension
-neo tabs [filter]                       # List open Chrome tabs
-neo mock <domain> [--port N] [--latency ms]  # Mock server from schema
-neo suggest <domain>                    # Suggest AI capabilities for a domain
-neo export-skill <domain>               # Generate agent-ready API reference (Markdown)
-neo version                             # Show version
+# --- Setup & Diagnostics ---
+neo setup                               # First-time setup (Chrome + extension)
+neo start                               # Launch Chrome with Neo extension
+neo doctor                              # Health check
+neo version                             # Version
 ```
 
-## Workflow: Find → Understand → Execute
+## Decision Tree
 
 ```
-1. neo capture search "CreateTweet"     # Find the API call
-2. neo capture detail <id>              # Inspect full request/response
-3. neo replay <id>                      # Replay it, or:
-   neo api x.com CreateTweet --body '{}'  # Smart call (finds URL + auth automatically)
-   neo exec <url> --auto-headers        # Execute with custom params
+User wants to interact with a website
+  │
+  ├─ Just read content? → neo read <domain>
+  │
+  ├─ Need to call an API?
+  │   ├─ neo schema show <domain> → schema exists? → neo api <domain> <keyword>
+  │   └─ No schema? → neo open <url> → browse → neo schema generate <domain>
+  │
+  ├─ Need to fill forms / click buttons?
+  │   └─ neo snapshot → neo click/fill/type @ref
+  │
+  └─ Complex multi-step interaction?
+      └─ Combine: neo open → neo snapshot → neo click/fill → neo read → close tab
 ```
 
-## Smart API Call (neo api)
+## Key Rules
 
-```bash
-neo api x.com badge_count               # GET badge count — zero config
-neo api x.com HomeTimeline              # Finds endpoint, reconstructs URL, auto-auth
-neo api github.com notifications        # Works across any domain with schema
-neo api x.com CreateTweet --body '{"variables":{"tweet_text":"hello"}}'
-```
-
-`neo api` = schema lookup + capture URL reconstruction + auto-auth headers + auto tab selection.
-Requires: captures exist + schema generated for the domain.
-
-## Schema with Trigger Mapping & Field Variability
-
-`neo schema show <domain>` shows which UI elements trigger which APIs and which body fields vary:
-
-```
-POST /i/api/graphql/:hash/CreateTweet  (12x, 340ms) [auth: x-csrf-token] body:{variables, features} [varies: variables]
-  ← click button.tweet-btn "Post" (8x)
-```
-
-This maps: user intent → UI element → API call → parameterizable fields.
-
-## Schema Knowledge Base
-
-Schemas are saved alongside the CLI (e.g. `schemas/<domain>.json`) — local API knowledge.
-
-Before calling an API, check schema: `neo schema show <domain>`
-No schema? Generate: `neo schema generate <domain>` (requires captures)
-
-Schemas are local-only, never in git. Personal browsing knowledge.
-
-## Decision: Neo vs Browser-Use
-
-1. `neo status` — does Neo have captures for this domain?
-2. **Yes** → `neo exec` or `neo replay` (fast, precise)
-3. **No** → `neo open <url>`, browse, captures accumulate, then use Neo
-4. **Fallback** → browser-use for complex UI interactions
-
-## WebSocket Bridge (real-time streaming)
-
-```bash
-neo bridge                              # Start bridge on ws://127.0.0.1:9234
-neo bridge 9234 --json                  # NDJSON output (pipe to jq, etc.)
-neo bridge --quiet                      # No stderr status messages
-neo bridge --interactive                # Type commands to query extension
-```
-
-The extension auto-connects to the bridge. Features:
-- **Real-time capture streaming**: see every API call as it happens
-- **Bidirectional commands**: ping, status, capture.count, capture.list
-- **NDJSON mode**: `neo bridge --json | jq .` for structured processing
-- **Auto-reconnect**: extension reconnects if bridge restarts
-
-Use bridge for long-running monitoring. Use CLI commands for one-off queries.
-
-## Key facts
-- Extension ID: `ikikhldfkbfmcbandaagjomhchlehjap`
-- Extension dist: see repo `extension/` directory
-- Source: https://github.com/4ier/neo
-- API calls execute in browser context — cookies/auth inherited automatically
-- Chrome must run with CDP on port 9222
-- Per-domain capture cap: 500 entries, auto-cleanup
-- Captures: fetch + XHR + WebSocket + EventSource/SSE
-- Trigger tracking: click/submit → API call correlation (2s window)
+1. **Always check CDP first**: Run `neo doctor` to verify Chrome is reachable
+2. **Close tabs after use**: `neo eval "window.close()" --tab <pattern>`
+3. **Check schema before API calls**: `neo schema show <domain>` — use cached knowledge
+4. **API > UI automation**: If an API exists, use `neo api`/`neo exec` instead of snapshot+click
+5. **Per-domain capture cap**: 500 entries, auto-cleanup. Don't worry about storage.
+6. **Auth is automatic**: API calls run in browser context, inheriting cookies/session/CSRF
