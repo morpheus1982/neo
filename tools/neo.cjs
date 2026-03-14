@@ -21,6 +21,7 @@
 //   neo setup                               Setup Neo local config + extension assets
 //   neo start                               Launch Chrome with Neo extension from config
 //   neo launch <app> [--port N]             Launch Electron app with CDP enabled
+//   neo attach                               Attach to user's running Chrome via DevToolsActivePort
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
 //   neo discover                            Discover reachable CDP targets on localhost ports
@@ -2252,6 +2253,35 @@ function stripGlobalSessionFlag(argv) {
   return clean;
 }
 
+// ---------------------------------------------------------------------------
+// DevToolsActivePort discovery (live attach to user's running Chrome)
+// ---------------------------------------------------------------------------
+
+function getDevToolsActivePort() {
+  const candidates = [
+    path.join(process.env.HOME, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
+    path.join(process.env.HOME, '.config/google-chrome/DevToolsActivePort'),
+    path.join(process.env.HOME, '.config/chromium/DevToolsActivePort'),
+    path.join(process.env.HOME, '.config/google-chrome-beta/DevToolsActivePort'),
+    path.join(process.env.HOME, '.config/google-chrome-unstable/DevToolsActivePort'),
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, 'utf8').trim();
+      const lines = content.split('\n');
+      if (lines.length < 2) continue;
+      const port = parseInt(lines[0], 10);
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+      return { port, wsPath: lines[1], filePath };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 async function connectToCdpPort(port, sessionName = DEFAULT_SESSION_NAME) {
   const cdpUrl = `http://localhost:${port}`;
   const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
@@ -2709,12 +2739,107 @@ commands.connect = async function(args, context = {}) {
   console.log(`Tab: ${connected.tabId || '(no-id)'} ${connected.page.title ? `- ${connected.page.title}` : ''}`);
 };
 
+// neo attach — connect to user's running Chrome via DevToolsActivePort
+commands.attach = async function(args, context = {}) {
+  const sessionName = (context && context.sessionName) || DEFAULT_SESSION_NAME;
+
+  // 1. Try DevToolsActivePort file
+  const activePort = getDevToolsActivePort();
+  let port = null;
+
+  if (activePort) {
+    // Verify the port is actually reachable
+    try {
+      await fetchJsonOrThrow(`http://localhost:${activePort.port}/json/version`, 2000);
+      port = activePort.port;
+      console.log(`Found Chrome via DevToolsActivePort (${activePort.filePath})`);
+    } catch {
+      console.log(`DevToolsActivePort file found but port ${activePort.port} not reachable, scanning...`);
+    }
+  }
+
+  // 2. Fallback: scan common ports
+  if (!port) {
+    const scanPorts = [9222, 9223, 9224, 9225];
+    for (const p of scanPorts) {
+      try {
+        await fetchJsonOrThrow(`http://localhost:${p}/json/version`, 1000);
+        port = p;
+        console.log(`Found Chrome CDP on port ${p}`);
+        break;
+      } catch {
+        // not on this port
+      }
+    }
+  }
+
+  if (!port) {
+    console.error('Could not find a running Chrome with debugging enabled.\n');
+    console.error('To enable Chrome remote debugging:');
+    console.error('  1. Open chrome://inspect/#remote-debugging in Chrome');
+    console.error('  2. Toggle the switch to enable remote debugging');
+    console.error('  3. Run neo attach again\n');
+    console.error('Or launch Chrome with: --remote-debugging-port=9222');
+    process.exit(1);
+  }
+
+  const connected = await connectToCdpPort(port, sessionName);
+  console.log(`Connected: ${connected.versionInfo.Browser || 'CDP'} @ ${connected.cdpUrl}`);
+  console.log(`Session: ${sessionName}`);
+
+  // List all open tabs
+  const targets = parseTabTargets(await fetchJsonOrThrow(`http://localhost:${port}/json/list`));
+  const pages = targets.filter(t => t.type === 'page');
+  if (pages.length > 0) {
+    console.log(`\nOpen tabs (${pages.length}):`);
+    for (const page of pages) {
+      const id = (page.id || '').slice(0, 12);
+      const title = (page.title || '(untitled)').substring(0, 50);
+      console.log(`  ${id}  ${title}`);
+      console.log(`         ${page.url}`);
+    }
+    console.log(`\nActive tab: ${connected.tabId || '(no-id)'}`);
+    console.log('Use neo tab <index> or neo tab --url <pattern> to switch tabs');
+  }
+};
+
 // neo discover
 commands.discover = async function() {
+  // Check DevToolsActivePort first
+  const activePort = getDevToolsActivePort();
+  if (activePort) {
+    try {
+      const cdpUrl = `http://localhost:${activePort.port}`;
+      const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`, 2000);
+      const browser = versionInfo?.Browser || 'Unknown Browser';
+      console.log(`[DevToolsActivePort] ${browser} (port ${activePort.port})`);
+      console.log(`  Source: ${activePort.filePath}`);
+      const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`, 2000);
+      const pages = Array.isArray(targets) ? targets.filter(t => t.type === 'page') : [];
+      if (!pages.length) {
+        console.log('  (no page targets)');
+      } else {
+        for (const page of pages) {
+          const tabId = page.id || page.targetId || '(no-id)';
+          const title = page.title || '(untitled)';
+          console.log(`  ${tabId} ${title}`);
+          console.log(`    ${page.url || '(no-url)'}`);
+        }
+      }
+      console.log('');
+    } catch {
+      console.log(`[DevToolsActivePort] Found file ${activePort.filePath} but port ${activePort.port} not reachable\n`);
+    }
+  }
+
+  // Scan port range (skip port already found via DevToolsActivePort)
   const startPort = 9222;
   const endPort = 9299;
   const ports = [];
-  for (let port = startPort; port <= endPort; port++) ports.push(port);
+  const skipPort = activePort ? activePort.port : -1;
+  for (let port = startPort; port <= endPort; port++) {
+    if (port !== skipPort) ports.push(port);
+  }
 
   const discovered = await Promise.all(ports.map(async (port) => {
     const cdpUrl = `http://localhost:${port}`;
