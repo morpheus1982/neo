@@ -1424,7 +1424,138 @@ function getSelector(el) {
   return tag + cls;
 }
 
+function normalizeCaptureSourceFlag(source) {
+  const value = String(source || 'all').trim().toLowerCase();
+  if (value === 'extension' || value === 'cdp' || value === 'all') return value;
+  return 'all';
+}
+
+function extractChromeProfileEmail(preferences) {
+  const prefs = preferences && typeof preferences === 'object' ? preferences : {};
+  const accountInfo = Array.isArray(prefs.account_info) ? prefs.account_info : [];
+  const first = accountInfo.find(item => item && typeof item.email === 'string' && item.email.trim());
+  if (first) return first.email.trim();
+  const googleServices = prefs.google && prefs.google.services && typeof prefs.google.services === 'object'
+    ? prefs.google.services
+    : {};
+  if (typeof googleServices.last_username === 'string' && googleServices.last_username.trim()) {
+    return googleServices.last_username.trim();
+  }
+  return '';
+}
+
+function resolveChromeProfileSelection(name, profiles = []) {
+  const target = String(name || '').trim();
+  if (!target) return { error: 'missing-name', matches: [] };
+  const source = Array.isArray(profiles) ? profiles : [];
+  const normalized = target.toLowerCase();
+  const matches = source.filter((profile) => {
+    const profileName = String(profile && profile.name || '');
+    const browserName = String(profile && profile.browserName || '');
+    const display = `${profileName} (${browserName})`;
+    const alias = `${browserName}:${profileName}`;
+    return profileName.toLowerCase() === normalized
+      || display.toLowerCase() === normalized
+      || alias.toLowerCase() === normalized;
+  });
+  if (!matches.length) return { error: 'not-found', matches: [] };
+  if (matches.length > 1) return { error: 'ambiguous', matches };
+  return { error: null, profile: matches[0], matches };
+}
+
+function parseChromeCommandFlags(commandLine = '') {
+  const text = String(commandLine || '');
+  const extract = (flag) => {
+    const quoted = text.match(new RegExp(`--${flag}=(\"[^\"]+\"|'[^']+'|\\S+)`));
+    if (!quoted) return '';
+    return quoted[1].replace(/^['"]|['"]$/g, '');
+  };
+  return {
+    userDataDir: extract('user-data-dir'),
+    profileDirectory: extract('profile-directory'),
+    remoteDebuggingPort: extract('remote-debugging-port'),
+  };
+}
+
+function isApiLikeOtherRequest(url, method, headers = {}) {
+  const upperMethod = String(method || 'GET').toUpperCase();
+  if (upperMethod !== 'GET') return true;
+  const acceptHeader = String(findHeaderKey(headers, 'accept') ? headers[findHeaderKey(headers, 'accept')] : '').toLowerCase();
+  const contentTypeHeader = String(findHeaderKey(headers, 'content-type') ? headers[findHeaderKey(headers, 'content-type')] : '').toLowerCase();
+  const requestedWith = String(findHeaderKey(headers, 'x-requested-with') ? headers[findHeaderKey(headers, 'x-requested-with')] : '').toLowerCase();
+  if (acceptHeader.includes('json') || acceptHeader.includes('graphql') || acceptHeader.includes('text/event-stream')) return true;
+  if (contentTypeHeader.includes('json') || contentTypeHeader.includes('graphql') || contentTypeHeader.includes('x-www-form-urlencoded')) return true;
+  if (requestedWith === 'xmlhttprequest') return true;
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.toLowerCase();
+    if (STATIC_RESOURCE_EXTENSIONS.test(pathname)) return false;
+    return /(\/api\/|\/graphql\b|\/rpc\b|\/ajax\b|\/rest\b|\/query\b|\/mutation\b|\.json$)/.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function shouldCaptureCdpRequest(url, resourceType, method = 'GET', headers = {}) {
+  const normalizedResourceType = String(resourceType || '').trim();
+  if (!['XHR', 'Fetch', 'Other'].includes(normalizedResourceType)) return false;
+  try {
+    const parsed = new URL(String(url || ''));
+    if (new Set(['chrome-extension:', 'devtools:', 'data:', 'blob:', 'about:']).has(parsed.protocol)) return false;
+    if (STATIC_RESOURCE_EXTENSIONS.test(parsed.pathname.toLowerCase())) return false;
+    if (normalizedResourceType === 'Other') {
+      return isApiLikeOtherRequest(parsed.toString(), method, headers);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 console.log('\nshouldSkipUrl:');
+test('normalizeCaptureSourceFlag defaults invalid values to all', () => {
+  assert.strictEqual(normalizeCaptureSourceFlag('weird'), 'all');
+  assert.strictEqual(normalizeCaptureSourceFlag('cdp'), 'cdp');
+});
+test('extractChromeProfileEmail prefers account_info email', () => {
+  assert.strictEqual(extractChromeProfileEmail({ account_info: [{ email: 'user@example.com' }] }), 'user@example.com');
+});
+test('extractChromeProfileEmail falls back to last_username', () => {
+  assert.strictEqual(extractChromeProfileEmail({ google: { services: { last_username: 'fallback@example.com' } } }), 'fallback@example.com');
+});
+test('resolveChromeProfileSelection matches browser-qualified names', () => {
+  const resolved = resolveChromeProfileSelection('Default (Google Chrome)', [
+    { name: 'Default', browserName: 'Google Chrome' },
+    { name: 'Profile 1', browserName: 'Chromium' },
+  ]);
+  assert.strictEqual(resolved.error, null);
+  assert.strictEqual(resolved.profile.browserName, 'Google Chrome');
+});
+test('resolveChromeProfileSelection reports ambiguity for duplicate names', () => {
+  const resolved = resolveChromeProfileSelection('Default', [
+    { name: 'Default', browserName: 'Google Chrome' },
+    { name: 'Default', browserName: 'Chromium' },
+  ]);
+  assert.strictEqual(resolved.error, 'ambiguous');
+  assert.strictEqual(resolved.matches.length, 2);
+});
+test('parseChromeCommandFlags extracts profile-related flags', () => {
+  const parsed = parseChromeCommandFlags("/usr/bin/google-chrome --remote-debugging-port=9222 --user-data-dir='/tmp/profile dir' --profile-directory=Default");
+  assert.strictEqual(parsed.remoteDebuggingPort, '9222');
+  assert.strictEqual(parsed.userDataDir, '/tmp/profile dir');
+  assert.strictEqual(parsed.profileDirectory, 'Default');
+});
+test('shouldCaptureCdpRequest keeps fetch/json requests', () => {
+  assert.strictEqual(shouldCaptureCdpRequest('https://example.com/api/graphql', 'Fetch', 'POST', { Accept: 'application/json' }), true);
+});
+test('shouldCaptureCdpRequest skips devtools and static assets', () => {
+  assert.strictEqual(shouldCaptureCdpRequest('devtools://devtools/bundled/app.js', 'Fetch'), false);
+  assert.strictEqual(shouldCaptureCdpRequest('https://example.com/app.js', 'XHR'), false);
+});
+test('shouldCaptureCdpRequest only keeps api-like Other requests', () => {
+  assert.strictEqual(shouldCaptureCdpRequest('https://example.com/dashboard', 'Other', 'GET', { Accept: 'text/html' }), false);
+  assert.strictEqual(shouldCaptureCdpRequest('https://example.com/api/data', 'Other', 'GET', { Accept: 'application/json' }), true);
+});
 test('skips static resources', () => assert(shouldSkipUrl('https://example.com/app.js')));
 test('skips images', () => assert(shouldSkipUrl('https://example.com/logo.png')));
 test('skips chrome-extension URLs', () => assert(shouldSkipUrl('chrome-extension://abc/page.html')));
