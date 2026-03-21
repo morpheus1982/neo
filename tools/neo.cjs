@@ -3,6 +3,8 @@
 //
 // Usage:
 //   neo status                              Overview of captured data
+//   neo capture start [--tab pattern]       Start CDP Network capture daemon
+//   neo capture stop                        Stop CDP Network capture daemon
 //   neo capture list [domain] [--limit N]   List captured API calls
 //   neo capture count                       Total capture count
 //   neo capture domains                     List domains with counts
@@ -19,7 +21,9 @@
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo setup                               Setup Neo local config + extension assets
-//   neo start                               Launch Chrome with Neo extension from config
+//   neo start                               Launch Chrome with configured profile
+//   neo profile list                        List system Chrome profiles
+//   neo profile use <name>                  Set default system Chrome profile
 //   neo launch <app> [--port N]             Launch Electron app with CDP enabled
 //   neo attach                               Attach to user's running Chrome via DevToolsActivePort
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
@@ -46,10 +50,11 @@
 //   neo workflow show <name>                 Show a saved workflow
 //   neo workflow run <name> [--params k=v]  Execute workflow step-by-step
 
-const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn, execSync } = require('child_process');
+let WebSocket = null;
 
 const CDP_URL = process.env.NEO_CDP_URL || 'http://localhost:9222';
 const DB_NAME = 'neo-capture-v01';
@@ -60,6 +65,9 @@ const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const EXTENSION_ID_CACHE_FILE = '/tmp/neo-ext-id';
 const NEO_BASE_DIR = path.join(process.env.HOME, '.neo');
+const NEO_ROOT_CONFIG_FILE = path.join(NEO_BASE_DIR, 'config.json');
+const LOCAL_CAPTURE_FILE = path.join(NEO_BASE_DIR, 'captures.json');
+const CDP_CAPTURE_STATE_FILE = '/tmp/neo-cdp-capture.json';
 const NEO_PROFILE = process.env.NEO_PROFILE || null;
 function getNeoHomeDir(profile) {
   const p = profile || NEO_PROFILE;
@@ -70,6 +78,12 @@ const NEO_CONFIG_FILE = path.join(NEO_HOME_DIR, 'config.json');
 const NEO_EXTENSION_DIR = path.join(NEO_HOME_DIR, 'extension');
 const DEFAULT_SESSION_NAME = '__default__';
 const EXTENSION_NOT_FOUND_MESSAGE = 'Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222';
+const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map|mp4|mpe?g|avi|mov|webm|pdf|zip|gz|tar|glb|gltf|obj|fbx|stl|dae|3ds|wasm|bin)(?:[?#].*)?$/i;
+const CDP_CAPTURE_SKIP_PROTOCOLS = new Set(['chrome-extension:', 'devtools:', 'data:', 'blob:', 'about:']);
+const CHROME_PROFILE_ROOTS = Object.freeze([
+  { browserName: 'Google Chrome', userDataDir: path.join(process.env.HOME, '.config/google-chrome') },
+  { browserName: 'Chromium', userDataDir: path.join(process.env.HOME, '.config/chromium') },
+]);
 const ELECTRON_APPS = Object.freeze({
   slack: Object.freeze(['/usr/bin/slack', 'slack']),
   code: Object.freeze(['/usr/bin/code', 'code']),
@@ -115,6 +129,60 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
   saveSessions(sessions);
   return sessions[name];
+}
+
+function ensureParentDirectory(filePath) {
+  const target = String(filePath || '').trim();
+  if (!target) return;
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+}
+
+function readJsonFileSafe(filePath, fallback = {}) {
+  const target = String(filePath || '').trim();
+  if (!target || !fs.existsSync(target)) return structuredClone(fallback);
+  try {
+    const raw = String(fs.readFileSync(target, 'utf8') || '').trim();
+    if (!raw) return structuredClone(fallback);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return structuredClone(fallback);
+    }
+    return parsed;
+  } catch {
+    return structuredClone(fallback);
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  ensureParentDirectory(filePath);
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+function getConfigFile(profileName = null) {
+  if (!profileName) return NEO_ROOT_CONFIG_FILE;
+  return path.join(getNeoHomeDir(profileName), 'config.json');
+}
+
+function loadNeoConfig(profileName = null) {
+  const rootConfig = readJsonFileSafe(NEO_ROOT_CONFIG_FILE, {});
+  if (!profileName) return rootConfig;
+  const profileConfig = readJsonFileSafe(getConfigFile(profileName), {});
+  return { ...rootConfig, ...profileConfig };
+}
+
+function saveNeoConfig(config, profileName = null) {
+  const targetFile = getConfigFile(profileName);
+  writeJsonFile(targetFile, (!config || typeof config !== 'object' || Array.isArray(config)) ? {} : config);
+}
+
+function getConfiguredCdpPort(profileName = null) {
+  const config = loadNeoConfig(profileName);
+  const parsed = parseInt(String(config && config.cdpPort !== undefined ? config.cdpPort : 9222), 10);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : 9222;
+}
+
+function getConfiguredCdpUrl(profileName = null) {
+  return `http://localhost:${getConfiguredCdpPort(profileName)}`;
 }
 
 function hasActiveSession(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
@@ -216,6 +284,157 @@ function detectChromeBinaryPath(deps = {}) {
   }
 
   return null;
+}
+
+function getWebSocketCtor() {
+  if (WebSocket) return WebSocket;
+  try {
+    WebSocket = require('ws');
+    return WebSocket;
+  } catch {
+    throw new Error('Missing dependency: ws. Install project dependencies before using CDP or bridge features.');
+  }
+}
+
+function extractChromeProfileEmail(preferences) {
+  const prefs = preferences && typeof preferences === 'object' ? preferences : {};
+  const accountInfo = Array.isArray(prefs.account_info) ? prefs.account_info : [];
+  const first = accountInfo.find(item => item && typeof item.email === 'string' && item.email.trim());
+  if (first) return first.email.trim();
+  const googleServices = prefs.google && prefs.google.services && typeof prefs.google.services === 'object'
+    ? prefs.google.services
+    : {};
+  if (typeof googleServices.last_username === 'string' && googleServices.last_username.trim()) {
+    return googleServices.last_username.trim();
+  }
+  return '';
+}
+
+function scanChromeProfiles(deps = {}) {
+  const readdirSyncFn = typeof deps.readdirSync === 'function' ? deps.readdirSync : fs.readdirSync;
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : fs.readFileSync;
+  const roots = Array.isArray(deps.roots) ? deps.roots : CHROME_PROFILE_ROOTS;
+  const profiles = [];
+
+  for (const root of roots) {
+    if (!root || !root.userDataDir) continue;
+    if (!existsSyncFn(root.userDataDir)) continue;
+    let entries = [];
+    try {
+      entries = readdirSyncFn(root.userDataDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const name = typeof entry === 'string' ? entry : entry && entry.name;
+      const isDirectory = typeof entry === 'string' ? true : !!(entry && typeof entry.isDirectory === 'function' && entry.isDirectory());
+      if (!name || !isDirectory) continue;
+      const preferencesFile = path.join(root.userDataDir, name, 'Preferences');
+      if (!existsSyncFn(preferencesFile)) continue;
+      let prefs = {};
+      try {
+        prefs = JSON.parse(readFileSyncFn(preferencesFile, 'utf8'));
+      } catch {}
+      const email = extractChromeProfileEmail(prefs);
+      profiles.push({
+        browserName: root.browserName || 'Chrome',
+        name: String(name),
+        email,
+        userDataDir: root.userDataDir,
+        profileDir: path.join(root.userDataDir, name),
+        preferencesFile,
+      });
+    }
+  }
+
+  return profiles.sort((a, b) => {
+    if (a.browserName !== b.browserName) return a.browserName.localeCompare(b.browserName);
+    if (a.name === 'Default' && b.name !== 'Default') return -1;
+    if (b.name === 'Default' && a.name !== 'Default') return 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function resolveChromeProfileSelection(name, profiles = []) {
+  const target = String(name || '').trim();
+  if (!target) return { error: 'missing-name', matches: [] };
+  const source = Array.isArray(profiles) ? profiles : [];
+  const normalized = target.toLowerCase();
+  const matches = source.filter((profile) => {
+    const profileName = String(profile && profile.name || '');
+    const browserName = String(profile && profile.browserName || '');
+    const display = `${profileName} (${browserName})`;
+    const alias = `${browserName}:${profileName}`;
+    return profileName.toLowerCase() === normalized
+      || display.toLowerCase() === normalized
+      || alias.toLowerCase() === normalized;
+  });
+  if (!matches.length) return { error: 'not-found', matches: [] };
+  if (matches.length > 1) return { error: 'ambiguous', matches };
+  return { error: null, profile: matches[0], matches };
+}
+
+function parseChromeCommandFlags(commandLine = '') {
+  const text = String(commandLine || '');
+  const extract = (flag) => {
+    const quoted = text.match(new RegExp(`--${flag}=(\"[^\"]+\"|'[^']+'|\\S+)`));
+    if (!quoted) return '';
+    return quoted[1].replace(/^['"]|['"]$/g, '');
+  };
+  return {
+    userDataDir: extract('user-data-dir'),
+    profileDirectory: extract('profile-directory'),
+    remoteDebuggingPort: extract('remote-debugging-port'),
+  };
+}
+
+function listChromeProcesses(deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : execSync;
+  const command = deps.command || 'ps -eo pid=,args=';
+  let output = '';
+  try {
+    output = String(execSyncFn(command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/sh',
+      timeout: 3000,
+    }) || '');
+  } catch {
+    return [];
+  }
+
+  const rows = [];
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = trimmed.match(/^(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const commandLine = match[2];
+    if (!/\b(chrome|chromium)\b/i.test(commandLine)) continue;
+    if (/chrome_crashpad_handler|chromium-browser-sandbox/i.test(commandLine)) continue;
+    const flags = parseChromeCommandFlags(commandLine);
+    rows.push({
+      pid: Number(match[1]),
+      commandLine,
+      browserName: /\bchromium\b/i.test(commandLine) ? 'Chromium' : 'Google Chrome',
+      userDataDir: flags.userDataDir || '',
+      profileDirectory: flags.profileDirectory || '',
+      remoteDebuggingPort: flags.remoteDebuggingPort ? Number(flags.remoteDebuggingPort) : 0,
+    });
+  }
+  return rows;
+}
+
+function describeConfiguredChromeProfile(config = {}) {
+  const activeConfig = config && typeof config === 'object' ? config : {};
+  const profileName = String(activeConfig.defaultProfile || '').trim();
+  const userDataDir = String(activeConfig.userDataDir || '').trim();
+  if (!profileName && !userDataDir) return 'Not configured';
+  const segments = [];
+  if (profileName) segments.push(profileName);
+  if (userDataDir) segments.push(userDataDir);
+  return segments.join(' @ ');
 }
 
 function isLightpandaBrowser(configOrPath) {
@@ -493,6 +712,325 @@ function applySessionCaptureFilters(captures, filters = {}) {
   return rows;
 }
 
+function stripCaptureLimitFilters(filters = {}) {
+  const config = (filters && typeof filters === 'object' && !Array.isArray(filters)) ? { ...filters } : {};
+  delete config.limit;
+  delete config.sort;
+  delete config.source;
+  return config;
+}
+
+function normalizeCaptureSourceFlag(source) {
+  const value = String(source || 'all').trim().toLowerCase();
+  if (value === 'extension' || value === 'cdp' || value === 'all') return value;
+  return 'all';
+}
+
+function truncateCaptureText(value, maxBytes = 102400) {
+  const text = String(value || '');
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let truncated = text;
+  while (Buffer.byteLength(truncated, 'utf8') > maxBytes && truncated.length > 0) {
+    truncated = truncated.slice(0, Math.max(1, Math.floor(truncated.length * 0.75)));
+  }
+  const skipped = Math.max(0, Buffer.byteLength(text, 'utf8') - Buffer.byteLength(truncated, 'utf8'));
+  return `${truncated}\n[truncated ${skipped} bytes]`;
+}
+
+function parseCaptureTextBody(raw, contentType) {
+  const text = String(raw || '');
+  const lowerType = String(contentType || '').toLowerCase();
+  const looksJson = lowerType.includes('application/json')
+    || lowerType.includes('+json')
+    || ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']')));
+  if (looksJson) {
+    try { return JSON.parse(text); }
+    catch {}
+  }
+  return truncateCaptureText(text);
+}
+
+function deriveCaptureDomain(url) {
+  try { return new URL(url).hostname; }
+  catch { return 'unknown'; }
+}
+
+function isApiLikeOtherRequest(url, method, headers = {}) {
+  const upperMethod = String(method || 'GET').toUpperCase();
+  if (upperMethod !== 'GET') return true;
+  const normalizedHeaders = headers && typeof headers === 'object' ? headers : {};
+  const acceptHeader = String(findHeaderKey(normalizedHeaders, 'accept') ? normalizedHeaders[findHeaderKey(normalizedHeaders, 'accept')] : '').toLowerCase();
+  const contentTypeHeader = String(findHeaderKey(normalizedHeaders, 'content-type') ? normalizedHeaders[findHeaderKey(normalizedHeaders, 'content-type')] : '').toLowerCase();
+  const requestedWith = String(findHeaderKey(normalizedHeaders, 'x-requested-with') ? normalizedHeaders[findHeaderKey(normalizedHeaders, 'x-requested-with')] : '').toLowerCase();
+  if (acceptHeader.includes('json') || acceptHeader.includes('graphql') || acceptHeader.includes('text/event-stream')) return true;
+  if (contentTypeHeader.includes('json') || contentTypeHeader.includes('graphql') || contentTypeHeader.includes('x-www-form-urlencoded')) return true;
+  if (requestedWith === 'xmlhttprequest') return true;
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.toLowerCase();
+    if (STATIC_RESOURCE_EXTENSIONS.test(pathname)) return false;
+    return /(\/api\/|\/graphql\b|\/rpc\b|\/ajax\b|\/rest\b|\/query\b|\/mutation\b|\.json$)/.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function shouldCaptureCdpRequest(url, resourceType, method = 'GET', headers = {}) {
+  const normalizedResourceType = String(resourceType || '').trim();
+  if (!normalizedResourceType) return false;
+  if (!['XHR', 'Fetch', 'Other'].includes(normalizedResourceType)) return false;
+  try {
+    const parsed = new URL(String(url || ''));
+    if (CDP_CAPTURE_SKIP_PROTOCOLS.has(parsed.protocol)) return false;
+    if (STATIC_RESOURCE_EXTENSIONS.test(parsed.pathname.toLowerCase())) return false;
+    if (normalizedResourceType === 'Other') {
+      return isApiLikeOtherRequest(parsed.toString(), method, headers);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeCdpResponseBody(body, mimeType = '', base64Encoded = false) {
+  if (body === undefined || body === null) return undefined;
+  try {
+    const decoded = base64Encoded ? Buffer.from(String(body), 'base64').toString('utf8') : String(body);
+    return parseCaptureTextBody(decoded, mimeType);
+  } catch {
+    return '[unreadable response body]';
+  }
+}
+
+function normalizeCdpRequestBody(postData, headers = {}) {
+  if (postData === undefined || postData === null || postData === '') return undefined;
+  const contentTypeKey = findHeaderKey(headers, 'content-type');
+  const contentType = contentTypeKey ? headers[contentTypeKey] : '';
+  return parseCaptureTextBody(String(postData), contentType);
+}
+
+function buildCdpCaptureRecord(entry, responseBody) {
+  const request = entry && entry.request ? entry.request : {};
+  const response = entry && entry.response ? entry.response : {};
+  const responseMimeType = String(response.mimeType || (findHeaderKey(response.headers || {}, 'content-type') ? response.headers[findHeaderKey(response.headers || {}, 'content-type')] : '') || '');
+  const startTimestamp = Number(entry && entry.timestamp) || Date.now();
+  const endTimestamp = Number(entry && entry.finishedAt) || startTimestamp;
+  const duration = Math.max(0, Math.round(endTimestamp - startTimestamp));
+  return {
+    id: entry && entry.id ? entry.id : crypto.randomUUID(),
+    timestamp: startTimestamp,
+    domain: deriveCaptureDomain(request.url),
+    url: String(request.url || ''),
+    method: String(request.method || 'GET').toUpperCase(),
+    requestHeaders: request.headers && typeof request.headers === 'object' ? { ...request.headers } : {},
+    requestBody: normalizeCdpRequestBody(request.postData, request.headers || {}),
+    responseStatus: Number(response.status) || 0,
+    responseHeaders: response.headers && typeof response.headers === 'object' ? { ...response.headers } : {},
+    responseBody,
+    duration,
+    trigger: undefined,
+    tabId: entry && entry.tabId !== undefined ? entry.tabId : -1,
+    tabUrl: String(entry && entry.tabUrl || request.documentURL || ''),
+    source: String(entry && entry.resourceType || '').toUpperCase() === 'XHR' ? 'xhr' : 'fetch',
+    mimeType: responseMimeType || undefined,
+  };
+}
+
+function readLocalCaptureJsonl(filePath = LOCAL_CAPTURE_FILE) {
+  const target = String(filePath || '').trim();
+  if (!target || !fs.existsSync(target)) return [];
+  try {
+    const raw = String(fs.readFileSync(target, 'utf8') || '');
+    const rows = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rows.push(parsed);
+      } catch {}
+    }
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalCaptureJsonl(rows, filePath = LOCAL_CAPTURE_FILE) {
+  ensureParentDirectory(filePath);
+  const items = Array.isArray(rows) ? rows.filter(item => item && typeof item === 'object' && !Array.isArray(item)) : [];
+  const payload = items.map(item => JSON.stringify(item)).join('\n');
+  fs.writeFileSync(filePath, payload ? `${payload}\n` : '', 'utf8');
+}
+
+function appendLocalCaptureRecord(record, filePath = LOCAL_CAPTURE_FILE) {
+  ensureParentDirectory(filePath);
+  fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+async function getExtensionCaptures(filters = {}, deps = {}) {
+  const cdpEvalFn = typeof deps.cdpEval === 'function' ? deps.cdpEval : cdpEval;
+  const findExtensionWsFn = typeof deps.findExtensionWs === 'function' ? deps.findExtensionWs : findExtensionWs;
+  const cdpUrl = deps.cdpUrl || CDP_URL;
+  const wsUrl = deps.wsUrl !== undefined ? deps.wsUrl : await findExtensionWsFn({ cdpUrl });
+  if (!wsUrl) return [];
+  const queryFilters = stripCaptureLimitFilters(filters);
+  const raw = await cdpEvalFn(wsUrl, dbEval(`
+    var rows = [];
+    var domain = ${queryFilters.domain ? JSON.stringify(String(queryFilters.domain)) : 'null'};
+    var method = ${queryFilters.method ? JSON.stringify(String(queryFilters.method).toUpperCase()) : 'null'};
+    var status = ${queryFilters.status !== undefined && queryFilters.status !== null && queryFilters.status !== '' ? Number(queryFilters.status) : 'null'};
+    var query = ${queryFilters.query ? JSON.stringify(String(queryFilters.query)) : 'null'};
+    var targetId = ${queryFilters.id ? JSON.stringify(String(queryFilters.id)) : 'null'};
+    var targetPrefix = ${queryFilters.idPrefix ? JSON.stringify(String(queryFilters.idPrefix)) : 'null'};
+    var since = ${queryFilters.since ? Number(queryFilters.since) : 0};
+    store.openCursor().onsuccess = function(e) {
+      var c = e.target.result;
+      if (!c) { resolve(JSON.stringify(rows)); return; }
+      var v = c.value || {};
+      if (since && (Number(v.timestamp) || 0) < since) { c.continue(); return; }
+      if (domain && String(v.domain || '') !== domain) { c.continue(); return; }
+      if (method && String(v.method || '').toUpperCase() !== method) { c.continue(); return; }
+      if (status !== null && Number(v.responseStatus) !== status) { c.continue(); return; }
+      if (query) {
+        var url = String(v.url || '');
+        var captureDomain = String(v.domain || '');
+        if (url.indexOf(query) < 0 && captureDomain.indexOf(query) < 0) { c.continue(); return; }
+      }
+      if (targetId && String(v.id || '') !== targetId) { c.continue(); return; }
+      if (targetPrefix && !String(v.id || '').startsWith(targetPrefix)) { c.continue(); return; }
+      rows.push(v);
+      c.continue();
+    };
+  `), 60000);
+  let rows = [];
+  try {
+    const parsed = JSON.parse(raw || '[]');
+    rows = Array.isArray(parsed) ? parsed : [];
+  } catch {}
+  return applySessionCaptureFilters(rows, queryFilters);
+}
+
+async function clearExtensionCaptureRecords(domain = null, deps = {}) {
+  const cdpEvalFn = typeof deps.cdpEval === 'function' ? deps.cdpEval : cdpEval;
+  const findExtensionWsFn = typeof deps.findExtensionWs === 'function' ? deps.findExtensionWs : findExtensionWs;
+  const cdpUrl = deps.cdpUrl || CDP_URL;
+  const wsUrl = deps.wsUrl !== undefined ? deps.wsUrl : await findExtensionWsFn({ cdpUrl });
+  if (!wsUrl) return { deleted: 0 };
+
+  if (domain) {
+    const result = await cdpEvalFn(wsUrl, `new Promise(function(resolve) {
+      var req = indexedDB.open("${DB_NAME}");
+      req.onsuccess = function() {
+        var db = req.result;
+        var tx = db.transaction("${STORE_NAME}", "readwrite");
+        var store = tx.objectStore("${STORE_NAME}");
+        var idx = store.index("domain");
+        var deleted = 0;
+        idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+          var c = e.target.result;
+          if (!c) { resolve(String(deleted)); return; }
+          c.delete();
+          deleted++;
+          c.continue();
+        };
+      };
+      req.onerror = function() { resolve("0"); };
+    })`, 30000);
+    return { deleted: Number(result) || 0 };
+  }
+
+  await cdpEvalFn(wsUrl, `new Promise(function(resolve) {
+    var req = indexedDB.open("${DB_NAME}");
+    req.onsuccess = function() {
+      var db = req.result;
+      var tx = db.transaction("${STORE_NAME}", "readwrite");
+      tx.objectStore("${STORE_NAME}").clear().onsuccess = function() { resolve("ok"); };
+      tx.onerror = function() { resolve("ok"); };
+    };
+    req.onerror = function() { resolve("ok"); };
+  })`, 15000);
+  return { deleted: 0 };
+}
+
+function clearLocalCaptureRecords(domain = null, filePath = LOCAL_CAPTURE_FILE) {
+  const existing = readLocalCaptureJsonl(filePath);
+  if (!existing.length) {
+    if (!domain && fs.existsSync(filePath)) writeLocalCaptureJsonl([], filePath);
+    return { deleted: 0, total: 0 };
+  }
+  const next = [];
+  let deleted = 0;
+  for (const item of existing) {
+    if (!domain || String(item && item.domain || '') === String(domain)) deleted++;
+    else next.push(item);
+  }
+  writeLocalCaptureJsonl(next, filePath);
+  return { deleted, total: next.length };
+}
+
+function readCaptureDaemonState(filePath = CDP_CAPTURE_STATE_FILE) {
+  return readJsonFileSafe(filePath, null);
+}
+
+function isProcessAlive(pid) {
+  const parsed = Number(pid);
+  if (!Number.isInteger(parsed) || parsed <= 0) return false;
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadCapturesFromSources(sessionName = DEFAULT_SESSION_NAME, filters = {}, deps = {}) {
+  const queryFilters = (filters && typeof filters === 'object' && !Array.isArray(filters)) ? { ...filters } : {};
+  const source = normalizeCaptureSourceFlag(queryFilters.source || 'all');
+  const storeFilters = stripCaptureLimitFilters(queryFilters);
+  const combined = [];
+  const cdpUrl = deps.cdpUrl || getSessionCdpUrl(sessionName);
+  const findExtensionWsFn = typeof deps.findExtensionWs === 'function' ? deps.findExtensionWs : findExtensionWs;
+  let extensionWsUrl = deps.extensionWsUrl;
+  if (extensionWsUrl === undefined && (source === 'all' || source === 'extension')) {
+    extensionWsUrl = await findExtensionWsFn({ cdpUrl });
+  }
+
+  if ((source === 'all' || source === 'extension') && extensionWsUrl) {
+    combined.push(...await getExtensionCaptures(storeFilters, {
+      ...deps,
+      wsUrl: extensionWsUrl,
+      cdpUrl,
+    }));
+  }
+
+  let cdpRows = [];
+  if (source === 'all' || source === 'cdp') {
+    cdpRows = applySessionCaptureFilters(readLocalCaptureJsonl(deps.captureFile || LOCAL_CAPTURE_FILE), storeFilters);
+    combined.push(...cdpRows);
+  }
+
+  if ((source === 'all' || source === 'cdp') && cdpRows.length === 0 && hasActiveSession(sessionName, deps)) {
+    try {
+      combined.push(...await getSessionCaptures(sessionName, storeFilters, deps));
+    } catch {}
+  }
+
+  return applySessionCaptureFilters(combined, queryFilters);
+}
+
+async function findCaptureById(sessionName = DEFAULT_SESSION_NAME, id, filters = {}, deps = {}) {
+  const targetId = String(id || '');
+  if (!targetId) return null;
+  const rows = await loadCapturesFromSources(sessionName, {
+    ...filters,
+    source: filters && filters.source ? filters.source : 'all',
+  }, deps);
+  return rows.find(item => item && String(item.id || '') === targetId)
+    || rows.find(item => item && String(item.id || '').startsWith(targetId))
+    || null;
+}
+
 async function getSessionCaptures(sessionName = DEFAULT_SESSION_NAME, filters = {}, deps = {}) {
   let resolvedFilters = filters;
   let resolvedDeps = deps;
@@ -618,11 +1156,12 @@ let _persistentWsIdCounter = 1;
 
 function cdpSendPersistent(wsUrl, method, params = {}, timeout = 10000) {
   return new Promise((resolve, reject) => {
+    const WebSocketCtor = getWebSocketCtor();
     if (!wsUrl) { reject(new Error('Missing WebSocket URL')); return; }
     if (!method) { reject(new Error('Missing CDP method')); return; }
 
     let entry = _persistentWsPool[wsUrl];
-    if (entry && (entry.ws.readyState === WebSocket.CLOSING || entry.ws.readyState === WebSocket.CLOSED)) {
+    if (entry && (entry.ws.readyState === WebSocketCtor.CLOSING || entry.ws.readyState === WebSocketCtor.CLOSED)) {
       delete _persistentWsPool[wsUrl];
       entry = null;
     }
@@ -651,11 +1190,11 @@ function cdpSendPersistent(wsUrl, method, params = {}, timeout = 10000) {
       ws.send(JSON.stringify(message));
     };
 
-    if (entry && entry.ws.readyState === WebSocket.OPEN) {
+    if (entry && entry.ws.readyState === WebSocketCtor.OPEN) {
       sendMessage(entry.ws);
     } else {
       // Create new persistent connection
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocketCtor(wsUrl);
       const connectTimer = setTimeout(() => {
         try { ws.close(); } catch {}
         reject(new Error(`CDP connect timeout: ${wsUrl}`));
@@ -682,6 +1221,7 @@ function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
   }
   // Chrome: per-tab WS URL, create a fresh connection each time
   return new Promise((resolve, reject) => {
+    const WebSocketCtor = getWebSocketCtor();
     if (!pageWsUrl) {
       reject(new Error('Missing page WebSocket URL'));
       return;
@@ -691,7 +1231,7 @@ function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
       return;
     }
 
-    const ws = new WebSocket(pageWsUrl);
+    const ws = new WebSocketCtor(pageWsUrl);
     const id = 1;
     let settled = false;
     const timer = setTimeout(() => {
@@ -735,7 +1275,8 @@ function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
 
 function cdpEval(wsUrl, expression, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const WebSocketCtor = getWebSocketCtor();
+    const ws = new WebSocketCtor(wsUrl);
     const timer = setTimeout(() => { ws.close(); reject(new Error('CDP timeout')); }, timeout);
     ws.on('open', () => {
       ws.send(JSON.stringify({ id: 1, method: 'Runtime.enable' }));
@@ -1227,7 +1768,8 @@ function captureLiveAuthHeadersFromTab(tab, domain, probeUrl, timeoutMs = 2500) 
   return new Promise((resolve) => {
     if (!tab?.webSocketDebuggerUrl || !domain) { resolve({}); return; }
 
-    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    const WebSocketCtor = getWebSocketCtor();
+    const ws = new WebSocketCtor(tab.webSocketDebuggerUrl);
     let nextId = 0;
     const pending = new Map();
     const matchingRequestIds = new Set();
@@ -1243,7 +1785,7 @@ function captureLiveAuthHeadersFromTab(tab, domain, probeUrl, timeoutMs = 2500) 
     };
 
     const send = (method, params = {}) => new Promise((resolveSend, rejectSend) => {
-      if (ws.readyState !== WebSocket.OPEN) {
+      if (ws.readyState !== WebSocketCtor.OPEN) {
         rejectSend(new Error('CDP socket not open'));
         return;
       }
@@ -2604,6 +3146,294 @@ ${raw}
 })();`;
 }
 
+async function waitForCaptureDaemonState(pid, stateFile = CDP_CAPTURE_STATE_FILE, timeoutMs = 4000, intervalMs = 100) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const state = readCaptureDaemonState(stateFile);
+    if (state && Number(state.pid) === Number(pid) && isProcessAlive(state.pid)) {
+      return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+
+async function startCdpCaptureDaemon(target, options = {}) {
+  const stateFile = options.stateFile || CDP_CAPTURE_STATE_FILE;
+  const captureFile = options.captureFile || LOCAL_CAPTURE_FILE;
+  const existing = readCaptureDaemonState(stateFile);
+  if (existing && isProcessAlive(existing.pid)) {
+    throw new Error(`CDP capture daemon already running (pid ${existing.pid})`);
+  }
+  if (existing && !isProcessAlive(existing.pid)) {
+    try { fs.unlinkSync(stateFile); } catch {}
+  }
+
+  const child = spawn(process.execPath, [
+    __filename,
+    '_capture-daemon',
+    '--ws-url', String(target && target.webSocketDebuggerUrl || ''),
+    '--tab-id', String(target && (target.id || target.targetId || '') || ''),
+    '--tab-url', String(target && target.url || ''),
+    '--state-file', stateFile,
+    '--capture-file', captureFile,
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const state = await waitForCaptureDaemonState(child.pid, stateFile);
+  if (!state) {
+    throw new Error('Failed to start CDP capture daemon');
+  }
+  return state;
+}
+
+async function stopCdpCaptureDaemon(stateFile = CDP_CAPTURE_STATE_FILE) {
+  const state = readCaptureDaemonState(stateFile);
+  if (!state) {
+    return { stopped: false, message: 'CDP capture daemon not running' };
+  }
+  if (!isProcessAlive(state.pid)) {
+    try { fs.unlinkSync(stateFile); } catch {}
+    return { stopped: false, message: 'Removed stale CDP capture daemon state' };
+  }
+  process.kill(Number(state.pid), 'SIGTERM');
+  const deadline = Date.now() + 4000;
+  while (Date.now() <= deadline) {
+    if (!isProcessAlive(state.pid)) {
+      try { if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile); } catch {}
+      return { stopped: true, message: `Stopped CDP capture daemon (pid ${state.pid})` };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { stopped: false, message: `Failed to stop CDP capture daemon (pid ${state.pid})` };
+}
+
+async function runCaptureDaemon(args) {
+  const { flags } = parseArgs(args || []);
+  const wsUrl = String(flags['ws-url'] || '').trim();
+  const tabId = String(flags['tab-id'] || '').trim();
+  const tabUrl = String(flags['tab-url'] || '').trim();
+  const stateFile = String(flags['state-file'] || CDP_CAPTURE_STATE_FILE);
+  const captureFile = String(flags['capture-file'] || LOCAL_CAPTURE_FILE);
+  if (!wsUrl) {
+    throw new Error('Missing --ws-url for _capture-daemon');
+  }
+
+  ensureParentDirectory(captureFile);
+  const pending = new Map();
+  const requests = new Map();
+  let nextId = 1;
+  let shuttingDown = false;
+  let ready = false;
+  let ws = null;
+  const WebSocketCtor = getWebSocketCtor();
+
+  function writeState(extra = {}) {
+    writeJsonFile(stateFile, {
+      pid: process.pid,
+      wsUrl,
+      tabId,
+      tabUrl,
+      startedAt: Date.now(),
+      ...extra,
+    });
+  }
+
+  function send(method, params = {}, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+      if (!ws || ws.readyState !== WebSocketCtor.OPEN) {
+        reject(new Error('CDP capture daemon socket is not open'));
+        return;
+      }
+      const id = nextId++;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`CDP timeout: ${method}`));
+      }, timeout);
+      pending.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  async function finalizeRequest(requestId, extra = {}) {
+    const entry = requests.get(requestId);
+    if (!entry) return;
+    requests.delete(requestId);
+    entry.response = { ...(entry.response || {}), ...(extra.response || {}) };
+    if (extra.finishedAt) entry.finishedAt = extra.finishedAt;
+    let responseBody = extra.responseBody;
+    if (responseBody === undefined && entry.response && entry.response.status !== 0) {
+      try {
+        const bodyResult = await send('Network.getResponseBody', { requestId }, 15000);
+        responseBody = normalizeCdpResponseBody(bodyResult && bodyResult.body, entry.response.mimeType, !!(bodyResult && bodyResult.base64Encoded));
+      } catch {
+        responseBody = undefined;
+      }
+    }
+    const record = buildCdpCaptureRecord(entry, responseBody);
+    appendLocalCaptureRecord(record, captureFile);
+  }
+
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      if (ws && ws.readyState === WebSocketCtor.OPEN) {
+        try { await send('Network.disable', {}, 3000); } catch {}
+        try { ws.close(); } catch {}
+      }
+    } finally {
+      try {
+        const current = readCaptureDaemonState(stateFile);
+        if (current && Number(current.pid) === process.pid) fs.unlinkSync(stateFile);
+      } catch {}
+      process.exit(0);
+    }
+  }
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  await new Promise((resolve, reject) => {
+    ws = new WebSocketCtor(wsUrl);
+
+    ws.on('open', async () => {
+      try {
+        await send('Network.enable', { maxPostDataSize: 1024 * 1024 }, 10000);
+        writeState({ ready: true });
+        ready = true;
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    ws.on('message', (raw) => {
+      let message;
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (message.id) {
+        const waiter = pending.get(message.id);
+        if (!waiter) return;
+        pending.delete(message.id);
+        if (message.error) waiter.reject(new Error(message.error.message || 'Unknown CDP error'));
+        else waiter.resolve(message.result);
+        return;
+      }
+
+      if (!message.method) return;
+      if (message.method === 'Network.requestWillBeSent') {
+        const params = message.params || {};
+        const request = params.request || {};
+        if (!shouldCaptureCdpRequest(request.url, params.type, request.method, request.headers || {})) return;
+        requests.set(String(params.requestId), {
+          id: crypto.randomUUID(),
+          requestId: String(params.requestId),
+          resourceType: params.type || 'Fetch',
+          timestamp: Number(params.wallTime) ? Math.round(Number(params.wallTime) * 1000) : Date.now(),
+          monotonicStartedAt: Number(params.timestamp) || 0,
+          tabId: tabId || -1,
+          tabUrl: params.documentURL || tabUrl,
+          request: {
+            url: String(request.url || ''),
+            method: String(request.method || 'GET').toUpperCase(),
+            headers: request.headers && typeof request.headers === 'object' ? { ...request.headers } : {},
+            postData: request.postData,
+            documentURL: params.documentURL || tabUrl,
+          },
+          response: {
+            status: 0,
+            headers: {},
+            mimeType: '',
+          },
+        });
+        return;
+      }
+
+      if (message.method === 'Network.responseReceived') {
+        const params = message.params || {};
+        const entry = requests.get(String(params.requestId));
+        if (!entry) return;
+        const response = params.response || {};
+        entry.response = {
+          status: Number(response.status) || 0,
+          headers: response.headers && typeof response.headers === 'object' ? { ...response.headers } : {},
+          mimeType: String(response.mimeType || ''),
+        };
+        return;
+      }
+
+      if (message.method === 'Network.loadingFinished') {
+        const params = message.params || {};
+        const entry = requests.get(String(params.requestId));
+        if (!entry) return;
+        const finishedAt = entry.monotonicStartedAt && Number(params.timestamp)
+          ? entry.timestamp + Math.max(0, Math.round((Number(params.timestamp) - entry.monotonicStartedAt) * 1000))
+          : Date.now();
+        finalizeRequest(String(params.requestId), { finishedAt }).catch(() => {});
+        return;
+      }
+
+      if (message.method === 'Network.loadingFailed') {
+        const params = message.params || {};
+        const entry = requests.get(String(params.requestId));
+        if (!entry) return;
+        const finishedAt = entry.monotonicStartedAt && Number(params.timestamp)
+          ? entry.timestamp + Math.max(0, Math.round((Number(params.timestamp) - entry.monotonicStartedAt) * 1000))
+          : Date.now();
+        finalizeRequest(String(params.requestId), {
+          finishedAt,
+          response: { status: Number(entry.response && entry.response.status) || 0 },
+          responseBody: params.errorText ? truncateCaptureText(String(params.errorText)) : undefined,
+        }).catch(() => {});
+      }
+    });
+
+    ws.on('close', () => {
+      if (shuttingDown) return;
+      if (!ready) {
+        reject(new Error('CDP capture daemon socket closed'));
+        return;
+      }
+      try {
+        const current = readCaptureDaemonState(stateFile);
+        if (current && Number(current.pid) === process.pid) fs.unlinkSync(stateFile);
+      } catch {}
+      process.exit(1);
+    });
+
+    ws.on('error', (error) => {
+      if (!ready) {
+        reject(error);
+        return;
+      }
+      try {
+        const current = readCaptureDaemonState(stateFile);
+        if (current && Number(current.pid) === process.pid) fs.unlinkSync(stateFile);
+      } catch {}
+      process.exit(1);
+    });
+  });
+
+  await new Promise(() => {});
+}
+
 // ─── Commands ───────────────────────────────────────────────────
 
 const commands = {};
@@ -2612,6 +3442,83 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+commands['_capture-daemon'] = async function(args) {
+  await runCaptureDaemon(args || []);
+};
+
+// neo profile <action>
+commands.profile = function(args) {
+  const { positional } = parseArgs(args || []);
+  const action = positional[0];
+
+  switch (action) {
+    case 'list': {
+      const profiles = scanChromeProfiles();
+      if (!profiles.length) {
+        console.log('No system Chrome profiles found.');
+        return;
+      }
+      const width = Math.max(...profiles.map(profile => profile.name.length), 7);
+      for (const profile of profiles) {
+        const email = profile.email || '(no account)';
+        console.log(`  ${profile.name.padEnd(width)}  ${email} (${profile.browserName})`);
+      }
+      return;
+    }
+
+    case 'use': {
+      const targetName = positional[1];
+      if (!targetName) {
+        console.error('Usage: neo profile use <name>');
+        process.exit(1);
+      }
+      const profiles = scanChromeProfiles();
+      const resolved = resolveChromeProfileSelection(targetName, profiles);
+      if (resolved.error === 'not-found') {
+        console.error(`Profile not found: ${targetName}`);
+        process.exit(1);
+      }
+      if (resolved.error === 'ambiguous') {
+        console.error(`Profile name is ambiguous: ${targetName}`);
+        for (const match of resolved.matches) {
+          console.error(`  - ${match.name} (${match.browserName})`);
+        }
+        process.exit(1);
+      }
+
+      const currentConfig = loadNeoConfig();
+      const nextConfig = {
+        ...currentConfig,
+        defaultProfile: resolved.profile.name,
+        userDataDir: resolved.profile.userDataDir,
+      };
+      saveNeoConfig(nextConfig);
+
+      console.log(`Using Chrome profile: ${resolved.profile.name} (${resolved.profile.browserName})`);
+      console.log(`  Email: ${resolved.profile.email || '(no account)'}`);
+      console.log(`  user-data-dir: ${resolved.profile.userDataDir}`);
+
+      const running = listChromeProcesses().find((proc) => proc && (proc.remoteDebuggingPort > 0 || proc.userDataDir || proc.profileDirectory));
+      if (running) {
+        const configuredProfile = resolved.profile.name;
+        const sameUserDataDir = !running.userDataDir || running.userDataDir === resolved.profile.userDataDir;
+        const sameProfileDir = !running.profileDirectory || running.profileDirectory === configuredProfile;
+        if (!sameUserDataDir || !sameProfileDir) {
+          console.warn('Warning: a running Chrome process appears to use a different profile.');
+          console.warn(`  Running: ${running.profileDirectory || '(unknown profile)'} @ ${running.userDataDir || '(default user-data-dir)'}`);
+        }
+      }
+      return;
+    }
+
+    default:
+      console.log(`neo profile — System Chrome profile management
+
+  neo profile list                       List system Chrome/Chromium profiles
+  neo profile use <name>                 Set the default Chrome profile in ~/.neo/config.json`);
+  }
 };
 
 // neo profiles — list configured profiles
@@ -2680,10 +3587,12 @@ commands.setup = async function(args) {
     } catch {}
   }
 
+  const existingConfig = loadNeoConfig(profileName);
   const config = {
-    chromePath: chromePath || lightpandaPath,
-    browserType: chromePath ? 'chrome' : 'lightpanda',
-    cdpPort: 9222,
+    ...existingConfig,
+    chromePath: chromePath || existingConfig.chromePath || lightpandaPath,
+    browserType: chromePath ? 'chrome' : (existingConfig.browserType || 'lightpanda'),
+    cdpPort: existingConfig.cdpPort || 9222,
   };
   if (detectedUserDataDir) config.userDataDir = detectedUserDataDir;
   if (profileName) config.profile = profileName;
@@ -2697,7 +3606,7 @@ commands.setup = async function(args) {
     }
   }
 
-  fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  saveNeoConfig(config, profileName);
 
   // Pre-register Neo extension in Chrome Preferences
   // Use detected user-data-dir if available, otherwise fall back to neo's own profile
@@ -2718,7 +3627,6 @@ commands.setup = async function(args) {
   prefs.extensions.ui.developer_mode = true;
 
   // Generate deterministic extension ID from path (same algorithm Chrome uses for unpacked)
-  const crypto = require('crypto');
   const extRealPath = fs.realpathSync(extensionDir);
   const hashHex = crypto.createHash('sha256').update(extRealPath).digest('hex').slice(0, 32);
   const extensionId = [...hashHex].map(c => String.fromCharCode('a'.charCodeAt(0) + parseInt(c, 16))).join('');
@@ -2789,20 +3697,17 @@ commands.start = async function(args) {
   const configFile = path.join(homeDir, 'config.json');
   const extensionDir = path.join(homeDir, 'extension');
 
-  if (!fs.existsSync(configFile)) {
+  if (!fs.existsSync(configFile) && !(profileName && fs.existsSync(NEO_ROOT_CONFIG_FILE))) {
     throw new Error(`Missing config: ${configFile}. Run neo setup${profileName ? ' --profile ' + profileName : ''} first`);
   }
 
-  let config = null;
-  try {
-    config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-  } catch {
-    throw new Error(`Invalid config JSON: ${configFile}`);
-  }
+  const config = loadNeoConfig(profileName);
 
   const browserType = String(config && config.browserType || 'chrome').trim();
   const browserPath = String(config && config.chromePath || '').trim();
   const cdpPort = parseInt(String(config && config.cdpPort !== undefined ? config.cdpPort : 9222), 10);
+  const configuredUserDataDir = String(config && config.userDataDir || '').trim();
+  const configuredProfileName = String(config && config.defaultProfile || '').trim();
   const useLightpanda = browserType === 'lightpanda' || isLightpandaBrowser(browserPath);
 
   if (!browserPath) {
@@ -2810,9 +3715,6 @@ commands.start = async function(args) {
   }
   if (!Number.isInteger(cdpPort) || cdpPort <= 0 || cdpPort > 65535) {
     throw new Error(`Invalid cdpPort in ${configFile}: ${config && config.cdpPort}`);
-  }
-  if (!useLightpanda && !fs.existsSync(extensionDir)) {
-    throw new Error(`Missing extension directory: ${extensionDir}. Run neo setup first`);
   }
   if (browserPath.includes('/') && !fs.existsSync(browserPath)) {
     throw new Error(`Browser binary does not exist: ${browserPath}`);
@@ -2842,27 +3744,33 @@ commands.start = async function(args) {
     child = spawn(browserPath, lpArgs, { detached: true, stdio: 'ignore' });
   } else {
     // Chrome: standard launch with extension and user-data-dir
-    const userDataDir = String(config && config.userDataDir || '').trim() || path.join(homeDir, 'chrome-profile');
+    const userDataDir = configuredUserDataDir || path.join(homeDir, 'chrome-profile');
     fs.mkdirSync(userDataDir, { recursive: true });
-    child = spawn(browserPath, [
+    const chromeArgs = [
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${userDataDir}`,
       '--no-first-run',
       '--no-default-browser-check',
-    ], { detached: true, stdio: 'ignore' });
+    ];
+    if (configuredProfileName) {
+      chromeArgs.push(`--profile-directory=${configuredProfileName}`);
+    }
+    child = spawn(browserPath, chromeArgs, { detached: true, stdio: 'ignore' });
   }
   child.unref();
 
   const ready = await waitForCdpPort(cdpPort, useLightpanda ? 3000 : 5000, 250);
   if (!ready) {
     const label = useLightpanda ? 'Lightpanda' : 'Chrome';
-    console.log(`Failed to start ${label}: CDP endpoint http://localhost:${cdpPort} did not respond in time`);
-    process.exit(1);
+    throw new Error(`Failed to start ${label}: CDP endpoint http://localhost:${cdpPort} did not respond in time`);
   }
 
   const label = useLightpanda ? 'Lightpanda' : 'Chrome';
   console.log(`${label} started on port ${cdpPort}`);
   console.log(`CDP endpoint: http://localhost:${cdpPort}`);
+  if (!useLightpanda && configuredProfileName) {
+    console.log(`Profile: ${configuredProfileName}`);
+  }
 };
 
 // neo launch <app> [--port N]
@@ -3707,23 +4615,20 @@ commands.label = async function(args) {
 };
 
 // neo status
-commands.status = async function() {
-  const wsUrl = await requireExtensionWs();
-  const count = await cdpEval(wsUrl, dbEval(`
-    store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
-  `));
-  const domains = await cdpEval(wsUrl, dbEval(`
-    var map = {};
-    store.openCursor().onsuccess = function(e) {
-      var c = e.target.result;
-      if (c) { map[c.value.domain] = (map[c.value.domain] || 0) + 1; c.continue(); }
-      else {
-        var sorted = Object.entries(map).sort(function(a,b){ return b[1]-a[1]; });
-        resolve(sorted.map(function(d){ return d[0] + ": " + d[1]; }).join("\\n"));
-      }
-    };
-  `));
-  console.log(`Total captures: ${count}\n`);
+commands.status = async function(args, context = {}) {
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const captures = await loadCapturesFromSources(sessionName, { source: 'all' });
+  const counts = {};
+  for (const capture of captures) {
+    const domain = String(capture && capture.domain || '');
+    if (!domain) continue;
+    counts[domain] = (counts[domain] || 0) + 1;
+  }
+  const domains = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([domain, count]) => `${domain}: ${count}`)
+    .join('\n');
+  console.log(`Total captures: ${captures.length}\n`);
   console.log(domains || '(no captures)');
 };
 
@@ -3733,229 +4638,143 @@ commands.capture = async function(args, context = {}) {
   const action = positional[0];
   const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
   const cdpUrl = getSessionCdpUrl(sessionName);
-  const extensionWsUrl = await findExtensionWs({ cdpUrl });
-  const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
-
-  function ensureCaptureSource() {
-    if (extensionWsUrl || sessionMode) return;
-    throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
-  }
+  const source = normalizeCaptureSourceFlag(flags.source || 'all');
 
   switch (action) {
-    case 'count': {
-      if (extensionWsUrl) {
-        const r = await cdpEval(extensionWsUrl, dbEval(`
-          store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
-        `));
-        console.log(r);
-      } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        console.log(String(captures.length));
+    case 'start': {
+      const tabPattern = typeof flags.tab === 'string' ? flags.tab : null;
+      const target = await findTab(tabPattern, { cdpUrl });
+      if (!target || !target.webSocketDebuggerUrl) {
+        throw new Error(`No page target found for ${cdpUrl}`);
       }
+      const state = await startCdpCaptureDaemon(target, {
+        stateFile: CDP_CAPTURE_STATE_FILE,
+        captureFile: LOCAL_CAPTURE_FILE,
+      });
+      console.log(`CDP capture started on tab ${target.id || '(no-id)'}`);
+      console.log(`  PID: ${state.pid}`);
+      console.log(`  WS: ${state.wsUrl}`);
+      console.log(`  Store: ${LOCAL_CAPTURE_FILE}`);
+      break;
+    }
+
+    case 'stop': {
+      const result = await stopCdpCaptureDaemon(CDP_CAPTURE_STATE_FILE);
+      console.log(result.message);
+      break;
+    }
+
+    case 'count': {
+      const captures = await loadCapturesFromSources(sessionName, { source });
+      console.log(String(captures.length));
       break;
     }
 
     case 'domains': {
-      if (extensionWsUrl) {
-        const r = await cdpEval(extensionWsUrl, dbEval(`
-          var map = {};
-          store.openCursor().onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) { map[c.value.domain] = (map[c.value.domain] || 0) + 1; c.continue(); }
-            else {
-              var sorted = Object.entries(map).sort(function(a,b){ return b[1]-a[1]; });
-              resolve(sorted.map(function(d){ return d[0] + ": " + d[1]; }).join("\\n"));
-            }
-          };
-        `));
-        console.log(r || '(no captures)');
-      } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        const counts = {};
-        for (const capture of captures) {
-          const domain = capture && capture.domain ? String(capture.domain) : '';
-          if (!domain) continue;
-          counts[domain] = (counts[domain] || 0) + 1;
-        }
-        const lines = Object.entries(counts)
-          .sort((a, b) => b[1] - a[1])
-          .map(([domain, count]) => `${domain}: ${count}`);
-        console.log(lines.join('\n') || '(no captures)');
+      const captures = await loadCapturesFromSources(sessionName, { source });
+      const counts = {};
+      for (const capture of captures) {
+        const domain = String(capture && capture.domain || '');
+        if (!domain) continue;
+        counts[domain] = (counts[domain] || 0) + 1;
       }
+      const lines = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([domain, count]) => `${domain}: ${count}`);
+      console.log(lines.join('\n') || '(no captures)');
       break;
     }
 
     case 'list': {
       const domain = positional[1];
-      const limit = parseInt(flags.limit) || 20;
+      const limit = parseInt(flags.limit, 10) || 20;
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
-      if (extensionWsUrl) {
-        const r = await cdpEval(extensionWsUrl, dbEval(`
-          var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, limit = ${limit}, since = ${since};
-          store.openCursor(null, "prev").onsuccess = function(e) {
-            var c = e.target.result;
-            if (c && rows.length < limit) {
-              var v = c.value;
-              if (since && v.timestamp < since) { resolve(rows.join("\\n")); return; }
-              if (!domain || v.domain === domain) {
-                var src = v.source === 'websocket' ? ' [ws]' : v.source === 'eventsource' ? ' [sse]' : '';
-                rows.push(v.id.slice(0,8) + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 90) + " (" + v.duration + "ms)" + src);
-              }
-              c.continue();
-            } else { resolve(rows.join("\\n")); }
-          };
-        `));
-        console.log(r || '(no captures)');
-      } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        const rows = [];
-        const sorted = captures.slice().sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
-        for (const capture of sorted) {
-          if (!capture || typeof capture !== 'object') continue;
-          if (rows.length >= limit) break;
-          if (since && (Number(capture.timestamp) || 0) < since) continue;
-          if (domain && capture.domain !== domain) continue;
-          const src = capture.source === 'websocket' ? ' [ws]' : capture.source === 'eventsource' ? ' [sse]' : '';
-          const shortId = String(capture.id || 'unknown').slice(0, 8);
-          const method = String(capture.method || 'GET');
-          const status = capture.responseStatus === undefined ? '?' : capture.responseStatus;
-          const url = String(capture.url || '').slice(0, 90);
-          const duration = Number(capture.duration) || 0;
-          rows.push(`${shortId}  ${method} ${status} ${url} (${duration}ms)${src}`);
-        }
-        console.log(rows.join('\n') || '(no captures)');
-      }
+      const captures = await loadCapturesFromSources(sessionName, {
+        source,
+        domain,
+        since,
+        sort: 'timestamp-desc',
+        limit,
+      });
+      const rows = captures.map((capture) => {
+        const src = capture.source === 'websocket' ? ' [ws]' : capture.source === 'eventsource' ? ' [sse]' : '';
+        const shortId = String(capture.id || 'unknown').slice(0, 8);
+        const method = String(capture.method || 'GET');
+        const status = capture.responseStatus === undefined ? '?' : capture.responseStatus;
+        const url = String(capture.url || '').slice(0, 90);
+        const duration = Number(capture.duration) || 0;
+        return `${shortId}  ${method} ${status} ${url} (${duration}ms)${src}`;
+      });
+      console.log(rows.join('\n') || '(no captures)');
       break;
     }
 
     case 'detail': {
       const id = positional[1];
-      if (!id) { console.error('Usage: neo capture detail <id> [--curl] [--neo]'); process.exit(1); }
-      let r = 'Not found';
-      if (extensionWsUrl) {
-        r = await cdpEval(extensionWsUrl, dbEval(`
-          var targetId = ${JSON.stringify(id)};
-          // Try exact match first, then prefix match
-          store.get(targetId).onsuccess = function(e) {
-            if (e.target.result) {
-              var v = e.target.result;
-              if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
-                v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
-              resolve(JSON.stringify(v, null, 2));
-            } else {
-              // Prefix search
-              var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
-              store.openCursor(bound).onsuccess = function(e2) {
-                var c = e2.target.result;
-                if (c) {
-                  var v = c.value;
-                  if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
-                    v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
-                  resolve(JSON.stringify(v, null, 2));
-                } else { resolve("Not found"); }
-              };
-            }
-          };
-        `));
-      } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        const exact = captures.find(item => item && String(item.id || '') === id);
-        const prefix = exact || captures.find(item => item && String(item.id || '').startsWith(id));
-        if (prefix) {
-          const copy = JSON.parse(JSON.stringify(prefix));
-          if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 5000) {
-            copy.responseBody = `${copy.responseBody.slice(0, 5000)}... [truncated]`;
-          }
-          r = JSON.stringify(copy, null, 2);
-        }
+      if (!id) { console.error('Usage: neo capture detail <id> [--curl] [--neo] [--source cdp|extension|all]'); process.exit(1); }
+      const capture = await findCaptureById(sessionName, id, { source, sort: 'timestamp-desc' }, { cdpUrl });
+      if (!capture) { console.log('Not found'); break; }
+      const copy = JSON.parse(JSON.stringify(capture));
+      if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 5000) {
+        copy.responseBody = `${copy.responseBody.slice(0, 5000)}... [truncated]`;
       }
-      if (r === 'Not found') { console.log(r); break; }
-      
+      const rendered = JSON.stringify(copy, null, 2);
+
       if (flags.curl || flags.neo) {
-        try {
-          const cap = JSON.parse(r);
-          if (flags.curl) {
-            // Generate curl command
-            const parts = [`curl -X ${cap.method} '${cap.url}'`];
-            for (const [k, v] of Object.entries(cap.requestHeaders || {})) {
-              if (k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') {
-                parts.push(`  -H '${k}: ${v}'`);
-              }
+        if (flags.curl) {
+          const parts = [`curl -X ${copy.method} '${copy.url}'`];
+          for (const [k, v] of Object.entries(copy.requestHeaders || {})) {
+            if (k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') {
+              parts.push(`  -H '${k}: ${v}'`);
             }
-            if (cap.requestBody && cap.method !== 'GET') {
-              const body = typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody);
-              parts.push(`  -d '${body.replace(/'/g, "'\\''")}'`);
-            }
-            console.log(parts.join(' \\\n'));
-          } else {
-            // Generate neo exec command
-            const parts = [`neo exec '${cap.url}'`];
-            if (cap.method !== 'GET') parts.push(`--method ${cap.method}`);
-            parts.push('--auto-headers');
-            if (cap.requestBody && cap.method !== 'GET') {
-              const body = typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody);
-              parts.push(`--body '${body.replace(/'/g, "'\\''")}'`);
-            }
-            console.log(parts.join(' '));
           }
-        } catch { console.log(r); }
+          if (copy.requestBody && copy.method !== 'GET') {
+            const body = typeof copy.requestBody === 'string' ? copy.requestBody : JSON.stringify(copy.requestBody);
+            parts.push(`  -d '${body.replace(/'/g, "'\\''")}'`);
+          }
+          console.log(parts.join(' \\\n'));
+        } else {
+          const parts = [`neo exec '${copy.url}'`];
+          if (copy.method !== 'GET') parts.push(`--method ${copy.method}`);
+          parts.push('--auto-headers');
+          if (copy.requestBody && copy.method !== 'GET') {
+            const body = typeof copy.requestBody === 'string' ? copy.requestBody : JSON.stringify(copy.requestBody);
+            parts.push(`--body '${body.replace(/'/g, "'\\''")}'`);
+          }
+          console.log(parts.join(' '));
+        }
       } else {
-        console.log(r);
+        console.log(rendered);
       }
       break;
     }
 
     case 'clear': {
       const domain = positional[1];
-      if (domain) {
-        let r;
+      if (!domain && !flags.all) {
+        console.error('Usage: neo capture clear <domain>  or  neo capture clear --all [--source cdp|extension|all]');
+        process.exit(1);
+      }
+      let deleted = 0;
+      if (source === 'all' || source === 'extension') {
+        const extensionWsUrl = await findExtensionWs({ cdpUrl });
         if (extensionWsUrl) {
-          r = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
-            var req = indexedDB.open("${DB_NAME}");
-            req.onsuccess = function() {
-              var db = req.result;
-              var tx = db.transaction("${STORE_NAME}", "readwrite");
-              var store = tx.objectStore("${STORE_NAME}");
-              var idx = store.index("domain");
-              var deleted = 0;
-              idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
-                var c = e.target.result;
-                if (c) { c.delete(); deleted++; c.continue(); }
-                else { resolve("Deleted " + deleted + " captures for ${domain}"); }
-              };
-            };
-            setTimeout(function() { resolve("timeout"); }, 10000);
-          })`);
-        } else {
-          ensureCaptureSource();
-          const cleared = await clearSessionCaptures(sessionName, domain);
-          r = `Deleted ${cleared.deleted} captures for ${domain}`;
+          const result = await clearExtensionCaptureRecords(flags.all ? null : domain, { wsUrl: extensionWsUrl, cdpUrl });
+          deleted += Number(result.deleted) || 0;
         }
-        console.log(r);
-      } else if (flags.all) {
-        let r;
-        if (extensionWsUrl) {
-          r = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
-            var req = indexedDB.open("${DB_NAME}");
-            req.onsuccess = function() {
-              var db = req.result;
-              var tx = db.transaction("${STORE_NAME}", "readwrite");
-              tx.objectStore("${STORE_NAME}").clear().onsuccess = function() { resolve("Cleared all captures"); };
-            };
-            setTimeout(function() { resolve("timeout"); }, 5000);
-          })`);
-        } else {
-          ensureCaptureSource();
-          await clearSessionCaptures(sessionName, null);
-          r = 'Cleared all captures';
+      }
+      if (source === 'all' || source === 'cdp') {
+        const local = clearLocalCaptureRecords(flags.all ? null : domain, LOCAL_CAPTURE_FILE);
+        deleted += local.deleted;
+        if (hasActiveSession(sessionName)) {
+          const sessionCleared = await clearSessionCaptures(sessionName, flags.all ? null : domain);
+          deleted += sessionCleared.deleted;
         }
-        console.log(r);
+      }
+      if (flags.all) {
+        console.log(`Cleared captures (${source})`);
       } else {
-        console.error('Usage: neo capture clear <domain>  or  neo capture clear --all');
+        console.log(`Deleted ${deleted} captures for ${domain} (${source})`);
       }
       break;
     }
@@ -3965,155 +4784,100 @@ commands.capture = async function(args, context = {}) {
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
       const format = flags.format || 'json';
       const includeAuth = flags['include-auth'] !== undefined;
-      let r;
-      if (extensionWsUrl) {
-        r = await cdpEval(extensionWsUrl, dbEval(`
-          var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
-          store.openCursor().onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) {
-              var v = c.value;
-              if (since && v.timestamp < since) { c.continue(); return; }
-              if (!domain || v.domain === domain) {
-                if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 2000)
-                  v.responseBody = v.responseBody.slice(0, 2000) + "...[truncated]";
-                rows.push(v);
-              }
-              c.continue();
-            } else { resolve(JSON.stringify(rows)); }
+      const captures = await loadCapturesFromSources(sessionName, {
+        source,
+        domain,
+        since,
+      });
+      const rows = captures.map((capture) => {
+        const copy = JSON.parse(JSON.stringify(capture));
+        if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 2000) {
+          copy.responseBody = `${copy.responseBody.slice(0, 2000)}...[truncated]`;
+        }
+        return copy;
+      });
+      const liveHeadersByDomain = includeAuth
+        ? await collectLiveHeadersByDomainForExport(rows)
+        : {};
+      const exportRows = rows.map(cap => applyExportAuthPolicy(cap, liveHeadersByDomain, includeAuth));
+      if (format === 'har') {
+        const entries = exportRows.map(cap => {
+          const reqHeaders = Object.entries(cap.requestHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+          const respHeaders = Object.entries(cap.responseHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+          const u = (() => { try { return new URL(cap.url); } catch { return null; } })();
+          const queryString = u ? [...u.searchParams].map(([n, v]) => ({ name: n, value: v })) : [];
+          const postData = cap.requestBody ? {
+            mimeType: (cap.requestHeaders || {})['content-type'] || 'application/json',
+            text: typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody),
+          } : undefined;
+          return {
+            startedDateTime: new Date(cap.timestamp).toISOString(),
+            time: cap.duration || 0,
+            request: {
+              method: cap.method,
+              url: cap.url,
+              httpVersion: 'HTTP/1.1',
+              cookies: [],
+              headers: reqHeaders,
+              queryString,
+              ...(postData ? { postData, bodySize: (postData.text || '').length } : { bodySize: 0 }),
+              headersSize: -1,
+            },
+            response: {
+              status: cap.responseStatus || 0,
+              statusText: '',
+              httpVersion: 'HTTP/1.1',
+              cookies: [],
+              headers: respHeaders,
+              content: {
+                size: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody.length : JSON.stringify(cap.responseBody).length) : 0,
+                mimeType: (cap.responseHeaders || {})['content-type'] || 'application/octet-stream',
+                text: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody : JSON.stringify(cap.responseBody)) : '',
+              },
+              redirectURL: '',
+              headersSize: -1,
+              bodySize: -1,
+            },
+            cache: {},
+            timings: { send: 0, wait: cap.duration || 0, receive: 0 },
           };
-        `), 60000);
+        });
+        console.log(JSON.stringify({
+          log: {
+            version: '1.2',
+            creator: { name: 'Neo', version: '0.6.0' },
+            entries,
+          },
+        }, null, 2));
       } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        const rows = [];
-        for (const capture of captures) {
-          if (!capture || typeof capture !== 'object') continue;
-          if (since && (Number(capture.timestamp) || 0) < since) continue;
-          if (domain && capture.domain !== domain) continue;
-          const copy = JSON.parse(JSON.stringify(capture));
-          if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 2000) {
-            copy.responseBody = `${copy.responseBody.slice(0, 2000)}...[truncated]`;
-          }
-          rows.push(copy);
-        }
-        r = JSON.stringify(rows);
+        console.log(JSON.stringify(exportRows, null, 2));
       }
-      try {
-        const parsed = JSON.parse(r);
-        const liveHeadersByDomain = includeAuth
-          ? await collectLiveHeadersByDomainForExport(parsed)
-          : {};
-
-        const exportRows = parsed.map(cap => applyExportAuthPolicy(cap, liveHeadersByDomain, includeAuth));
-        if (format === 'har') {
-          // Convert to HAR 1.2 format (compatible with Postman, Charles, browser devtools)
-          const entries = exportRows.map(cap => {
-            const reqHeaders = Object.entries(cap.requestHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
-            const respHeaders = Object.entries(cap.responseHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
-            const u = (() => { try { return new URL(cap.url); } catch { return null; } })();
-            const queryString = u ? [...u.searchParams].map(([n, v]) => ({ name: n, value: v })) : [];
-            const postData = cap.requestBody ? {
-              mimeType: (cap.requestHeaders || {})['content-type'] || 'application/json',
-              text: typeof cap.requestBody === 'string' ? cap.requestBody : JSON.stringify(cap.requestBody)
-            } : undefined;
-            return {
-              startedDateTime: new Date(cap.timestamp).toISOString(),
-              time: cap.duration || 0,
-              request: {
-                method: cap.method,
-                url: cap.url,
-                httpVersion: 'HTTP/1.1',
-                cookies: [],
-                headers: reqHeaders,
-                queryString,
-                ...(postData ? { postData, bodySize: (postData.text || '').length } : { bodySize: 0 }),
-                headersSize: -1,
-              },
-              response: {
-                status: cap.responseStatus || 0,
-                statusText: '',
-                httpVersion: 'HTTP/1.1',
-                cookies: [],
-                headers: respHeaders,
-                content: {
-                  size: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody.length : JSON.stringify(cap.responseBody).length) : 0,
-                  mimeType: (cap.responseHeaders || {})['content-type'] || 'application/octet-stream',
-                  text: cap.responseBody ? (typeof cap.responseBody === 'string' ? cap.responseBody : JSON.stringify(cap.responseBody)) : '',
-                },
-                redirectURL: '',
-                headersSize: -1,
-                bodySize: -1,
-              },
-              cache: {},
-              timings: { send: 0, wait: cap.duration || 0, receive: 0 },
-            };
-          });
-          const har = {
-            log: {
-              version: '1.2',
-              creator: { name: 'Neo', version: '0.6.0' },
-              entries,
-            }
-          };
-          console.log(JSON.stringify(har, null, 2));
-        } else {
-          console.log(JSON.stringify(exportRows, null, 2));
-        }
-      } catch { console.log(r); }
       break;
     }
 
     case 'stats': {
       const domain = positional[1];
-      if (!domain) { console.error('Usage: neo capture stats <domain>'); process.exit(1); }
-      let stats;
-      if (extensionWsUrl) {
-        const r = await cdpEval(extensionWsUrl, dbEval(`
-          var stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
-          var domain = ${JSON.stringify(domain)};
-          store.openCursor().onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) {
-              var v = c.value;
-              if (v.domain === domain) {
-                stats.total++;
-                stats.methods[v.method] = (stats.methods[v.method] || 0) + 1;
-                stats.statuses[v.responseStatus] = (stats.statuses[v.responseStatus] || 0) + 1;
-                stats.sources[v.source || 'fetch'] = (stats.sources[v.source || 'fetch'] || 0) + 1;
-                stats.totalDuration += (v.duration || 0);
-                if (v.responseStatus >= 400 || v.responseStatus === 0) stats.errors++;
-              }
-              c.continue();
-            } else {
-              resolve(JSON.stringify(stats));
-            }
-          };
-        `));
-        stats = JSON.parse(r);
-      } else {
-        ensureCaptureSource();
-        stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
-        const captures = await getSessionCaptures(sessionName);
-        for (const capture of captures) {
-          if (!capture || capture.domain !== domain) continue;
-          stats.total++;
-          const method = String(capture.method || 'GET');
-          const status = capture.responseStatus;
-          const source = capture.source || 'fetch';
-          const duration = Number(capture.duration) || 0;
-          stats.methods[method] = (stats.methods[method] || 0) + 1;
-          stats.statuses[status] = (stats.statuses[status] || 0) + 1;
-          stats.sources[source] = (stats.sources[source] || 0) + 1;
-          stats.totalDuration += duration;
-          if (status >= 400 || status === 0) stats.errors++;
-        }
+      if (!domain) { console.error('Usage: neo capture stats <domain> [--source cdp|extension|all]'); process.exit(1); }
+      const stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
+      const captures = await loadCapturesFromSources(sessionName, { source, domain });
+      for (const capture of captures) {
+        if (!capture || capture.domain !== domain) continue;
+        stats.total++;
+        const method = String(capture.method || 'GET');
+        const status = capture.responseStatus;
+        const captureSource = capture.source || 'fetch';
+        const duration = Number(capture.duration) || 0;
+        stats.methods[method] = (stats.methods[method] || 0) + 1;
+        stats.statuses[status] = (stats.statuses[status] || 0) + 1;
+        stats.sources[captureSource] = (stats.sources[captureSource] || 0) + 1;
+        stats.totalDuration += duration;
+        if (status >= 400 || status === 0) stats.errors++;
       }
       if (!stats.total) { console.log(`No captures for ${domain}`); break; }
       console.log(`${domain} — ${stats.total} captures\n`);
-      console.log(`Methods:  ${Object.entries(stats.methods).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
-      console.log(`Statuses: ${Object.entries(stats.statuses).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
-      console.log(`Sources:  ${Object.entries(stats.sources).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
+      console.log(`Methods:  ${Object.entries(stats.methods).map(([k, v]) => `${k}: ${v}`).join(', ')}`);
+      console.log(`Statuses: ${Object.entries(stats.statuses).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${v}`).join(', ')}`);
+      console.log(`Sources:  ${Object.entries(stats.sources).map(([k, v]) => `${k}: ${v}`).join(', ')}`);
       console.log(`Avg duration: ${Math.round(stats.totalDuration / stats.total)}ms`);
       console.log(`Error rate: ${(stats.errors / stats.total * 100).toFixed(1)}%`);
       break;
@@ -4121,46 +4885,20 @@ commands.capture = async function(args, context = {}) {
 
     case 'search': {
       const query = positional.slice(1).join(' ');
-      if (!query) { console.error('Usage: neo capture search <query> [--method GET] [--status 200] [--limit N]'); process.exit(1); }
-      const limit = parseInt(flags.limit) || 20;
-      const methodFilter = flags.method ? flags.method.toUpperCase() : null;
-      const statusFilter = flags.status ? parseInt(flags.status) : null;
-      if (extensionWsUrl) {
-        const r = await cdpEval(extensionWsUrl, dbEval(`
-          var rows = [], query = ${JSON.stringify(query)}, limit = ${limit};
-          var methodFilter = ${methodFilter ? JSON.stringify(methodFilter) : 'null'};
-          var statusFilter = ${statusFilter || 'null'};
-          store.openCursor(null, "prev").onsuccess = function(e) {
-            var c = e.target.result;
-            if (c && rows.length < limit) {
-              var v = c.value;
-              if (v.url.indexOf(query) >= 0 || (v.domain && v.domain.indexOf(query) >= 0)) {
-                if (methodFilter && v.method !== methodFilter) { c.continue(); return; }
-                if (statusFilter && v.responseStatus !== statusFilter) { c.continue(); return; }
-                rows.push(v.id + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)");
-              }
-              c.continue();
-            } else { resolve(rows.join("\\n")); }
-          };
-        `));
-        console.log(r || '(no matches)');
-      } else {
-        ensureCaptureSource();
-        const captures = await getSessionCaptures(sessionName);
-        const rows = [];
-        const sorted = captures.slice().sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
-        for (const capture of sorted) {
-          if (!capture || typeof capture !== 'object') continue;
-          if (rows.length >= limit) break;
-          const url = String(capture.url || '');
-          const captureDomain = String(capture.domain || '');
-          if (url.indexOf(query) < 0 && captureDomain.indexOf(query) < 0) continue;
-          if (methodFilter && String(capture.method || '').toUpperCase() !== methodFilter) continue;
-          if (statusFilter && Number(capture.responseStatus) !== statusFilter) continue;
-          rows.push(`${capture.id || ''}  ${capture.method || 'GET'} ${capture.responseStatus} ${url.slice(0, 100)} (${Number(capture.duration) || 0}ms)`);
-        }
-        console.log(rows.join('\n') || '(no matches)');
-      }
+      if (!query) { console.error('Usage: neo capture search <query> [--method GET] [--status 200] [--limit N] [--source cdp|extension|all]'); process.exit(1); }
+      const limit = parseInt(flags.limit, 10) || 20;
+      const methodFilter = flags.method ? String(flags.method).toUpperCase() : null;
+      const statusFilter = flags.status ? parseInt(flags.status, 10) : null;
+      const captures = await loadCapturesFromSources(sessionName, {
+        source,
+        query,
+        method: methodFilter,
+        status: statusFilter,
+        sort: 'timestamp-desc',
+        limit,
+      });
+      const rows = captures.map((capture) => `${capture.id || ''}  ${capture.method || 'GET'} ${capture.responseStatus} ${String(capture.url || '').slice(0, 100)} (${Number(capture.duration) || 0}ms)`);
+      console.log(rows.join('\n') || '(no matches)');
       break;
     }
 
@@ -4172,7 +4910,6 @@ commands.capture = async function(args, context = {}) {
       const items = Array.isArray(data) ? data : [data];
       if (!items.length) { console.log('No captures in file'); break; }
       const wsUrl = await requireExtensionWs();
-      // Import in batches of 50 via the extension's IndexedDB
       const batchSize = 50;
       let imported = 0;
       for (let i = 0; i < items.length; i += batchSize) {
@@ -4194,42 +4931,30 @@ commands.capture = async function(args, context = {}) {
           req.onerror = function() { resolve("Error: " + req.error); };
           setTimeout(function() { resolve("timeout"); }, 30000);
         })`, 35000);
-        const n = parseInt(result);
+        const n = parseInt(result, 10);
         if (!isNaN(n)) imported += n;
-        else { console.error(`Batch error: ${result}`); }
+        else console.error(`Batch error: ${result}`);
       }
       console.log(`Imported ${imported} captures from ${file}`);
       break;
     }
 
     case 'watch': {
-      const wsUrl = await requireExtensionWs();
       const domain = positional[1];
       console.error(`Watching captures${domain ? ' for ' + domain : ''}... (Ctrl+C to stop)`);
       let lastTimestamp = Date.now();
       const poll = async () => {
         try {
-          const r = await cdpEval(wsUrl, dbEval(`
-            var rows = [];
-            var domain = ${domain ? JSON.stringify(domain) : 'null'};
-            var since = ${lastTimestamp};
-            store.openCursor(null, "prev").onsuccess = function(e) {
-              var c = e.target.result;
-              if (c) {
-                var v = c.value;
-                if (v.timestamp <= since) { resolve(JSON.stringify(rows)); return; }
-                if (!domain || v.domain === domain) {
-                  rows.push({ method: v.method, status: v.responseStatus, url: v.url, duration: v.duration, timestamp: v.timestamp, source: v.source || 'fetch' });
-                }
-                c.continue();
-              } else { resolve(JSON.stringify(rows)); }
-            };
-          `));
-          const items = JSON.parse(r);
+          const items = await loadCapturesFromSources(sessionName, {
+            source,
+            domain,
+            since: lastTimestamp + 1,
+            sort: 'timestamp-desc',
+          });
           for (const item of items.reverse()) {
             const time = new Date(item.timestamp).toLocaleTimeString();
             const src = item.source === 'websocket' ? ' [ws]' : item.source === 'eventsource' ? ' [sse]' : '';
-            console.log(`${time}  ${item.method} ${item.status} ${item.url.slice(0, 100)} (${item.duration}ms)${src}`);
+            console.log(`${time}  ${item.method} ${item.responseStatus} ${String(item.url || '').slice(0, 100)} (${item.duration || 0}ms)${src}`);
             if (item.timestamp > lastTimestamp) lastTimestamp = item.timestamp;
           }
         } catch {}
@@ -4237,151 +4962,128 @@ commands.capture = async function(args, context = {}) {
       await poll();
       const interval = setInterval(poll, 2000);
       process.on('SIGINT', () => { clearInterval(interval); process.exit(0); });
-      await new Promise(() => {}); // Block forever
+      await new Promise(() => {});
       break;
     }
 
     case 'summary': {
-      const wsUrl = await requireExtensionWs();
-      // Quick overview optimized for AI agents
-      const r = await cdpEval(wsUrl, dbEval(`
-        var domains = {}, sources = {}, total = 0, oldest = Infinity, newest = 0;
-        store.openCursor().onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            total++;
-            domains[v.domain] = (domains[v.domain] || 0) + 1;
-            sources[v.source || 'fetch'] = (sources[v.source || 'fetch'] || 0) + 1;
-            if (v.timestamp < oldest) oldest = v.timestamp;
-            if (v.timestamp > newest) newest = v.timestamp;
-            c.continue();
-          } else {
-            resolve(JSON.stringify({ total: total, domains: domains, sources: sources, oldest: oldest, newest: newest }));
-          }
-        };
-      `));
-      const s = JSON.parse(r);
-      if (!s.total) { console.log('No captures.'); break; }
-      const span = Math.round((s.newest - s.oldest) / 3600000);
-      console.log(`${s.total} captures across ${Object.keys(s.domains).length} domains (${span}h span)\n`);
-      console.log('Sources:', Object.entries(s.sources).map(([k,v])=>`${k}: ${v}`).join(', '));
+      const captures = await loadCapturesFromSources(sessionName, { source });
+      const summary = { total: 0, domains: {}, sources: {}, oldest: Infinity, newest: 0 };
+      for (const capture of captures) {
+        summary.total++;
+        summary.domains[capture.domain] = (summary.domains[capture.domain] || 0) + 1;
+        summary.sources[capture.source || 'fetch'] = (summary.sources[capture.source || 'fetch'] || 0) + 1;
+        if (capture.timestamp < summary.oldest) summary.oldest = capture.timestamp;
+        if (capture.timestamp > summary.newest) summary.newest = capture.timestamp;
+      }
+      if (!summary.total) { console.log('No captures.'); break; }
+      const span = Math.round((summary.newest - summary.oldest) / 3600000);
+      console.log(`${summary.total} captures across ${Object.keys(summary.domains).length} domains (${span}h span)\n`);
+      console.log('Sources:', Object.entries(summary.sources).map(([k, v]) => `${k}: ${v}`).join(', '));
       console.log('\nDomains:');
-      const sorted = Object.entries(s.domains).sort((a,b)=>b[1]-a[1]);
-      for (const [d, c] of sorted.slice(0, 15)) {
-        console.log(`  ${d}: ${c}`);
+      const sorted = Object.entries(summary.domains).sort((a, b) => b[1] - a[1]);
+      for (const [domain, count] of sorted.slice(0, 15)) {
+        console.log(`  ${domain}: ${count}`);
       }
       if (sorted.length > 15) console.log(`  ... and ${sorted.length - 15} more`);
       break;
     }
 
     case 'prune': {
-      const wsUrl = await requireExtensionWs();
       const older = flags['older-than'] || flags.older || '7d';
       const cutoff = Date.now() - parseDuration(older);
-      const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
-        var req = indexedDB.open("${DB_NAME}");
-        req.onsuccess = function() {
-          var db = req.result;
-          var tx = db.transaction("${STORE_NAME}", "readwrite");
-          var store = tx.objectStore("${STORE_NAME}");
-          var deleted = 0;
-          store.openCursor().onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) {
-              if (c.value.timestamp < ${cutoff}) { c.delete(); deleted++; }
-              c.continue();
-            } else { resolve(String(deleted)); }
-          };
-          tx.onerror = function() { resolve("Error: " + tx.error); };
-        };
-        req.onerror = function() { resolve("Error: " + req.error); };
-      })`, 60000);
-      console.log(`Pruned ${r} captures older than ${older}`);
+      let deleted = 0;
+      if (source === 'all' || source === 'cdp') {
+        const keep = readLocalCaptureJsonl(LOCAL_CAPTURE_FILE).filter((item) => {
+          const keepItem = (Number(item && item.timestamp) || 0) >= cutoff;
+          if (!keepItem) deleted++;
+          return keepItem;
+        });
+        writeLocalCaptureJsonl(keep, LOCAL_CAPTURE_FILE);
+      }
+      if (source === 'all' || source === 'extension') {
+        const extensionWsUrl = await findExtensionWs({ cdpUrl });
+        if (extensionWsUrl) {
+          const r = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
+            var req = indexedDB.open("${DB_NAME}");
+            req.onsuccess = function() {
+              var db = req.result;
+              var tx = db.transaction("${STORE_NAME}", "readwrite");
+              var store = tx.objectStore("${STORE_NAME}");
+              var deleted = 0;
+              store.openCursor().onsuccess = function(e) {
+                var c = e.target.result;
+                if (c) {
+                  if ((Number(c.value.timestamp) || 0) < ${cutoff}) { c.delete(); deleted++; }
+                  c.continue();
+                } else { resolve(String(deleted)); }
+              };
+              tx.onerror = function() { resolve("0"); };
+            };
+            req.onerror = function() { resolve("0"); };
+          })`, 60000);
+          deleted += Number(r) || 0;
+        }
+      }
+      console.log(`Pruned ${deleted} captures older than ${older}`);
       break;
     }
 
     case 'gc': {
-      const wsUrl = await requireExtensionWs();
-      // Smart garbage collection: keep one capture per unique (method, path pattern, status) combo per domain
-      // Keeps the most recent of each unique pattern
       const domain = positional[1];
       const dryRun = flags['dry-run'] || flags.dryrun;
-      const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
-        var req = indexedDB.open("${DB_NAME}");
-        req.onsuccess = function() {
-          var db = req.result;
-          var tx = db.transaction("${STORE_NAME}", ${dryRun ? '"readonly"' : '"readwrite"'});
-          var store = tx.objectStore("${STORE_NAME}");
-          var seen = {};  // key → {id, timestamp}
-          var toDelete = [];
-          var domain = ${domain ? JSON.stringify(domain) : 'null'};
-          store.openCursor().onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) {
-              var v = c.value;
-              if (domain && v.domain !== domain) { c.continue(); return; }
-              // Build pattern key: method + pathname (sans query) + status
-              var pathname = '/';
-              try { pathname = new URL(v.url).pathname; } catch(e) {}
-              // Parameterize: replace UUIDs, numeric IDs, hashes
-              pathname = pathname.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
-              pathname = pathname.replace(/\\/\\d{4,}/g, '/:id');
-              var key = v.method + ' ' + v.domain + pathname + ' ' + (v.responseStatus || '?');
-              if (!seen[key] || v.timestamp > seen[key].timestamp) {
-                if (seen[key]) toDelete.push(seen[key].id);
-                seen[key] = { id: c.key, timestamp: v.timestamp };
-              } else {
-                toDelete.push(c.key);
-              }
-              c.continue();
-            } else {
-              ${dryRun ? '' : `
-              var deleted = 0;
-              if (toDelete.length === 0) { resolve(JSON.stringify({kept: Object.keys(seen).length, deleted: 0})); return; }
-              for (var i = 0; i < toDelete.length; i++) {
-                store.delete(toDelete[i]).onsuccess = function() {
-                  deleted++;
-                  if (deleted === toDelete.length) {
-                    resolve(JSON.stringify({kept: Object.keys(seen).length, deleted: deleted}));
-                  }
-                };
-              }
-              `}
-              ${dryRun ? 'resolve(JSON.stringify({kept: Object.keys(seen).length, wouldDelete: toDelete.length}));' : ''}
-            }
-          };
-          tx.onerror = function() { resolve("Error: " + tx.error); };
-        };
-        req.onerror = function() { resolve("Error: " + req.error); };
-      })`, 60000);
-      try {
-        const result = JSON.parse(r);
-        if (dryRun) {
-          console.log(`[dry-run] Would keep ${result.kept} unique patterns, delete ${result.wouldDelete} duplicates`);
-        } else {
-          console.log(`Kept ${result.kept} unique patterns, deleted ${result.deleted} duplicates`);
+      const captures = await loadCapturesFromSources(sessionName, { source, domain, sort: 'timestamp-desc' });
+      const seen = new Map();
+      let duplicateCount = 0;
+      const keepRows = [];
+      for (const capture of captures) {
+        let pathname = '/';
+        try { pathname = new URL(capture.url).pathname; } catch {}
+        pathname = pathname.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
+        pathname = pathname.replace(/\/\d{4,}/g, '/:id');
+        const key = `${capture.method} ${capture.domain}${pathname} ${capture.responseStatus || '?'}`;
+        if (seen.has(key)) {
+          duplicateCount++;
+          continue;
         }
-      } catch { console.log(r); }
+        seen.set(key, true);
+        keepRows.push(capture);
+      }
+      if (dryRun) {
+        console.log(`[dry-run] Would keep ${keepRows.length} unique patterns, delete ${duplicateCount} duplicates`);
+        break;
+      }
+      if (source === 'all' || source === 'cdp') {
+        const current = readLocalCaptureJsonl(LOCAL_CAPTURE_FILE);
+        const keepIds = new Set(keepRows.map((item) => String(item.id || '')));
+        writeLocalCaptureJsonl(current.filter((item) => keepIds.has(String(item && item.id || ''))), LOCAL_CAPTURE_FILE);
+      }
+      console.log(`Kept ${keepRows.length} unique patterns, deleted ${duplicateCount} duplicates`);
       break;
     }
 
     default:
       console.log(`neo capture — Manage captured API traffic
 
-  neo capture list [domain] [--limit N]   List recent captures
-  neo capture count                       Total capture count
-  neo capture domains                     List domains with counts
-  neo capture stats <domain>              Domain statistics (methods, errors, timing)
-  neo capture detail <id>                 Show full capture details
-  neo capture search <query>              Search captures by URL (--method, --status, --limit)
-  neo capture clear [domain]              Clear captures (all or by domain)
-  neo capture export [domain] [--since 1h] [--format har] [--include-auth] Export as JSON or HAR 1.2
-  neo capture import <file>               Import captures from JSON file
-  neo capture watch [domain]              Live tail of new captures
-  neo capture summary                     Quick overview for AI agents
-  neo capture prune [--older-than 7d]     Delete old captures
-  neo capture gc [domain] [--dry-run]     Smart dedup: keep one per unique pattern`);
+  neo capture start [--tab pattern]         Start CDP Network capture daemon
+  neo capture stop                          Stop CDP Network capture daemon
+  neo capture list [domain] [--limit N]     List recent captures
+  neo capture count                         Total capture count
+  neo capture domains                       List domains with counts
+  neo capture stats <domain>                Domain statistics (methods, errors, timing)
+  neo capture detail <id>                   Show full capture details
+  neo capture search <query>                Search captures by URL (--method, --status, --limit)
+  neo capture clear [domain]                Clear captures (all or by domain)
+  neo capture export [domain] [--since 1h] [--format har] [--include-auth]
+                                            Export as JSON or HAR 1.2
+  neo capture import <file>                 Import captures from JSON file
+  neo capture watch [domain]                Live tail of new captures
+  neo capture summary                       Quick overview for AI agents
+  neo capture prune [--older-than 7d]       Delete old captures
+  neo capture gc [domain] [--dry-run]       Smart dedup: keep one per unique pattern
+
+Options:
+  --source cdp|extension|all                Filter capture store source (default: all)`);
   }
 };
 
@@ -4395,40 +5097,16 @@ commands.schema = async function(args, context = {}) {
   switch (action) {
     case 'generate': {
       const domain = positional[1];
-      const extensionWsUrl = await findExtensionWs({ cdpUrl });
-      const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
+      const source = normalizeCaptureSourceFlag(flags.source || 'all');
       
       // --all: generate schemas for all domains with captures
       if (flags.all || domain === '--all') {
         let domainCounts = {};
-        if (extensionWsUrl) {
-          const domainsJson = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
-            var req = indexedDB.open("${DB_NAME}");
-            req.onsuccess = function() {
-              var db = req.result;
-              var tx = db.transaction("${STORE_NAME}", "readonly");
-              var store = tx.objectStore("${STORE_NAME}");
-              var idx = store.index("domain");
-              var domains = {};
-              idx.openKeyCursor().onsuccess = function(e) {
-                var c = e.target.result;
-                if (c) { domains[c.key] = (domains[c.key] || 0) + 1; c.continue(); }
-                else { resolve(JSON.stringify(domains)); }
-              };
-            };
-            req.onerror = function() { resolve('{}'); };
-          })`, 10000);
-          domainCounts = JSON.parse(domainsJson || '{}');
-        } else {
-          if (!sessionMode) {
-            throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
-          }
-          const captures = await getSessionCaptures(sessionName);
-          for (const capture of captures) {
-            const d = capture && capture.domain ? String(capture.domain) : '';
-            if (!d) continue;
-            domainCounts[d] = (domainCounts[d] || 0) + 1;
-          }
+        const captures = await loadCapturesFromSources(sessionName, { source }, { cdpUrl });
+        for (const capture of captures) {
+          const d = capture && capture.domain ? String(capture.domain) : '';
+          if (!d) continue;
+          domainCounts[d] = (domainCounts[d] || 0) + 1;
         }
         const domainList = Object.entries(domainCounts)
           .filter(([, count]) => count >= 2)  // skip domains with only 1 capture
@@ -4446,7 +5124,8 @@ commands.schema = async function(args, context = {}) {
             // Inline the single-domain generation (call the same CLI)
             const { execSync } = require('child_process');
             const sessionArg = sessionName ? ` --session ${shellEscape(sessionName)}` : '';
-            execSync(`node ${__filename} schema generate ${shellEscape(d)} --json${sessionArg}`, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 40000 });
+            const sourceArg = source !== 'all' ? ` --source ${shellEscape(source)}` : '';
+            execSync(`node ${__filename} schema generate ${shellEscape(d)} --json${sourceArg}${sessionArg}`, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 40000 });
             console.log('✓');
             generated++;
           } catch (e) {
@@ -4460,209 +5139,8 @@ commands.schema = async function(args, context = {}) {
       
       if (!domain) { console.error('Usage: neo schema generate <domain> | neo schema generate --all'); process.exit(1); }
       
-      let schema;
-      if (extensionWsUrl) {
-        // Run schema analysis INSIDE the browser to avoid transferring raw captures
-        const schemaJson = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
-        var req = indexedDB.open("${DB_NAME}");
-        req.onsuccess = function() {
-          var db = req.result;
-          var tx = db.transaction("${STORE_NAME}", "readonly");
-          var store = tx.objectStore("${STORE_NAME}");
-          var idx = store.index("domain");
-          var endpoints = {};
-          
-          // Extract key structure from an object (depth limited)
-          function extractKeys(obj, maxDepth) {
-            if (maxDepth <= 0 || !obj || typeof obj !== 'object') return typeof obj;
-            if (Array.isArray(obj)) return obj.length > 0 ? [extractKeys(obj[0], maxDepth - 1)] : [];
-            var result = {};
-            for (var k in obj) {
-              if (obj.hasOwnProperty(k)) {
-                var v = obj[k];
-                if (v === null) result[k] = 'null';
-                else if (typeof v === 'object') result[k] = extractKeys(v, maxDepth - 1);
-                else result[k] = typeof v;
-              }
-            }
-            return result;
-          }
-          
-          // Normalize paths: collapse variable segments (hashes, IDs, UUIDs)
-          function normalizePath(p) {
-            return p.split('/').map(function(seg) {
-              if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return ':uuid';
-              if (/^\\d{4,}$/.test(seg)) return ':id';
-              // GraphQL hashes: 15-30 chars, mixed case, high entropy
-              if (/^[a-zA-Z0-9_-]{15,30}$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg)) {
-                // Count digit-letter transitions (hashes have many, names don't)
-                var tr = 0;
-                for (var i = 1; i < seg.length; i++) {
-                  if (/\\d/.test(seg[i-1]) !== /\\d/.test(seg[i])) tr++;
-                }
-                if (tr >= 3) return ':hash';
-                // No 4+ consecutive lowercase = not a word = likely hash
-                if (!/[a-z]{4,}/.test(seg)) return ':hash';
-              }
-              return seg;
-            }).join('/');
-          }
-          var total = 0;
-          var authKeys = ['authorization', 'x-csrf-token', 'x-twitter-auth-type',
-            'x-requested-with', 'x-github-client-version', 'x-client-transaction-id',
-            'x-twitter-active-user', 'x-twitter-client-language', 'x-fetch-nonce',
-            'github-verified-fetch', 'x-api-key', 'api-key'];
-          
-          idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
-            var c = e.target.result;
-            if (c) {
-              var v = c.value;
-              total++;
-              try {
-                var u = new URL(v.url);
-                var key = v.method + " " + normalizePath(u.pathname);
-                if (!endpoints[key]) {
-                  endpoints[key] = {
-                    method: v.method, path: normalizePath(u.pathname),
-                    queryParams: {}, statusCodes: {},
-                    headers: {}, durations: [], count: 0, responseType: null,
-                    bodyKeys: null,
-                    bodySamples: [],
-                    responseKeys: null,
-                    triggers: {},
-                    sources: {}
-                  };
-                }
-                var ep = endpoints[key];
-                ep.count++;
-                ep.sources[v.source || 'fetch'] = (ep.sources[v.source || 'fetch'] || 0) + 1;
-                u.searchParams.forEach(function(val, k) { ep.queryParams[k] = true; });
-                ep.statusCodes[v.responseStatus] = (ep.statusCodes[v.responseStatus] || 0) + 1;
-                if (v.duration) ep.durations.push(v.duration);
-                
-                // Extract request body structure (collect up to 5 samples for variability analysis)
-                if (v.requestBody && ep.bodySamples.length < 5) {
-                  try {
-                    var bodyStr = typeof v.requestBody === 'string' ? v.requestBody : JSON.stringify(v.requestBody);
-                    var bodyObj = JSON.parse(bodyStr);
-                    if (bodyObj && typeof bodyObj === 'object' && !Array.isArray(bodyObj)) {
-                      if (!ep.bodyKeys) ep.bodyKeys = extractKeys(bodyObj, 2);
-                      // Store top-level key→value pairs for variability detection
-                      var sample = {};
-                      for (var bk in bodyObj) {
-                        if (bodyObj.hasOwnProperty(bk)) {
-                          var bv = bodyObj[bk];
-                          sample[bk] = (bv === null || bv === undefined) ? null
-                            : (typeof bv === 'object') ? JSON.stringify(bv)
-                            : String(bv);
-                        }
-                      }
-                      ep.bodySamples.push(sample);
-                    }
-                  } catch(ex2) {}
-                }
-                
-                // Extract response body structure (first successful response)
-                if (!ep.responseKeys && v.responseStatus >= 200 && v.responseStatus < 300 && v.responseBody) {
-                  try {
-                    var respStr = typeof v.responseBody === 'string' ? v.responseBody : JSON.stringify(v.responseBody);
-                    var respObj = JSON.parse(respStr);
-                    if (respObj && typeof respObj === 'object') {
-                      ep.responseKeys = extractKeys(respObj, 2);
-                    }
-                  } catch(ex3) {}
-                }
-                var rh = v.requestHeaders || {};
-                for (var hk in rh) {
-                  var lk = hk.toLowerCase();
-                  if (authKeys.indexOf(lk) >= 0 || lk.startsWith('x-csrf') || lk.startsWith('x-api')) {
-                    ep.headers[hk] = true;  // Track header name only
-                  }
-                }
-                var ct = (v.responseHeaders || {})['content-type'] || '';
-                if (ct.indexOf('json') >= 0) ep.responseType = 'json';
-                else if (ct.indexOf('html') >= 0) ep.responseType = 'html';
-                else if (ct.indexOf('text') >= 0) ep.responseType = 'text';
-                // Aggregate trigger info
-                if (v.trigger && v.trigger.selector) {
-                  var tKey = v.trigger.event + ' ' + v.trigger.selector;
-                  if (!ep.triggers[tKey]) {
-                    ep.triggers[tKey] = { event: v.trigger.event, selector: v.trigger.selector, text: v.trigger.text, count: 0 };
-                  }
-                  ep.triggers[tKey].count++;
-                }
-              } catch(ex) {}
-              c.continue();
-            } else {
-              // Build final schema
-              var epList = Object.values(endpoints).sort(function(a,b) { return b.count - a.count; });
-              var result = {
-                domain: ${JSON.stringify(domain)},
-                generatedAt: new Date().toISOString(),
-                totalCaptures: total,
-                uniqueEndpoints: epList.length,
-                endpoints: epList.map(function(ep) {
-                  var avg = ep.durations.length
-                    ? Math.round(ep.durations.reduce(function(a,b){return a+b;},0) / ep.durations.length) + 'ms'
-                    : null;
-                  return {
-                    method: ep.method, path: ep.path, callCount: ep.count,
-                    queryParams: Object.keys(ep.queryParams),
-                    statusCodes: ep.statusCodes,
-                    avgDuration: avg,
-                    authHeaders: Object.keys(ep.headers).length
-                      ? Object.keys(ep.headers)  // Only store header NAMES, not values
-                      : undefined,
-                    responseType: ep.responseType,
-                    source: Object.keys(ep.sources).length === 1 ? Object.keys(ep.sources)[0] : ep.sources,
-                    requestBodyStructure: ep.bodyKeys || undefined,
-                    bodyFieldVariability: (function() {
-                      if (ep.bodySamples.length < 2) return undefined;
-                      var allKeys = {};
-                      ep.bodySamples.forEach(function(s) { for (var k in s) allKeys[k] = true; });
-                      var result = {};
-                      for (var k in allKeys) {
-                        var vals = new Set();
-                        ep.bodySamples.forEach(function(s) { if (s[k] !== undefined) vals.add(s[k]); });
-                        result[k] = vals.size <= 1 ? 'constant' : 'variable';
-                      }
-                      return Object.keys(result).length ? result : undefined;
-                    })(),
-                    responseBodyStructure: ep.responseKeys || undefined,
-                    triggers: Object.keys(ep.triggers).length
-                      ? Object.values(ep.triggers).sort(function(a,b){ return b.count - a.count; }).slice(0, 5)
-                      : undefined,
-                    category: (function() {
-                      var m = ep.method;
-                      var p = ep.path.toLowerCase();
-                      if (m.startsWith('WS_') || m.startsWith('SSE_')) return 'realtime';
-                      if (p.includes('auth') || p.includes('login') || p.includes('token') || p.includes('oauth') || p.includes('session')) return 'auth';
-                      if (p.includes('search') || p.includes('query')) return 'search';
-                      if (p.includes('/log_') || p.includes('/log/') || p.endsWith('/log') || p.includes('track') || p.includes('/event') || p.includes('beacon') || p.includes('metric') || p.includes('telemetry')) return 'telemetry';
-                      if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'read';
-                      if (m === 'POST' || m === 'PUT' || m === 'PATCH' || m === 'DELETE') return 'write';
-                      return undefined;
-                    })()
-                  };
-                })
-              };
-              resolve(JSON.stringify(result));
-            }
-          };
-        };
-        req.onerror = function() { resolve(JSON.stringify({error: "DB open failed"})); };
-        setTimeout(function() { resolve(JSON.stringify({error: "timeout"})); }, 30000);
-      })`, 35000);
-
-        try { schema = JSON.parse(schemaJson); } catch { console.error('Failed to parse schema result'); process.exit(1); }
-        if (schema.error) { console.error('Error:', schema.error); process.exit(1); }
-      } else {
-        if (!sessionMode) {
-          throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
-        }
-        const captures = await getSessionCaptures(sessionName);
-        schema = buildSchemaFromCaptures(domain, captures);
-      }
+      const captures = await loadCapturesFromSources(sessionName, { source, domain }, { cdpUrl });
+      const schema = buildSchemaFromCaptures(domain, captures);
 
       if (!schema.totalCaptures) { console.error(`No captures for ${domain}`); process.exit(1); }
       
@@ -4771,16 +5249,13 @@ commands.schema = async function(args, context = {}) {
 
     case 'coverage': {
       // Show which domains have schemas vs just captures
-      const wsUrl = await findExtensionWs();
-      const domainsJson = await cdpEval(wsUrl, dbEval(`
-        var domains = {};
-        store.openCursor().onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) { var d = c.value.domain; domains[d] = (domains[d] || 0) + 1; c.continue(); }
-          else { resolve(JSON.stringify(domains)); }
-        };
-      `), 15000);
-      const domainCounts = JSON.parse(domainsJson || '{}');
+      const domainCounts = {};
+      const captures = await loadCapturesFromSources(sessionName, { source: 'all' }, { cdpUrl });
+      for (const capture of captures) {
+        const domain = capture && capture.domain ? String(capture.domain) : '';
+        if (!domain) continue;
+        domainCounts[domain] = (domainCounts[domain] || 0) + 1;
+      }
       const schemaFiles = fs.existsSync(SCHEMA_DIR)
         ? new Set(fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', '')))
         : new Set();
@@ -5195,34 +5670,7 @@ commands.replay = async function(args, context = {}) {
   const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
   const cdpUrl = getSessionCdpUrl(sessionName);
   const extensionWsUrl = await findExtensionWs({ cdpUrl });
-  const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
-
-  let capture = null;
-  if (extensionWsUrl) {
-    const raw = await cdpEval(extensionWsUrl, dbEval(`
-      var targetId = ${JSON.stringify(id)};
-      store.get(targetId).onsuccess = function(e) {
-        if (e.target.result) { resolve(JSON.stringify(e.target.result)); }
-        else {
-          var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
-          store.openCursor(bound).onsuccess = function(e2) {
-            var c = e2.target.result;
-            resolve(c ? JSON.stringify(c.value) : "null");
-          };
-        }
-      };
-    `));
-    if (raw && raw !== 'null') {
-      capture = JSON.parse(raw);
-    }
-  } else if (sessionMode) {
-    const captures = await getSessionCaptures(sessionName, { sort: 'timestamp-desc' });
-    capture = captures.find(item => item && String(item.id || '') === id)
-      || captures.find(item => item && String(item.id || '').startsWith(id))
-      || null;
-  } else {
-    throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
-  }
+  const capture = await findCaptureById(sessionName, id, { sort: 'timestamp-desc', source: 'all' }, { cdpUrl, extensionWsUrl });
   if (!capture) { console.error(`Capture not found: ${id}`); process.exit(1); }
 
   if (capture.method.startsWith('WS_')) {
@@ -6512,51 +6960,91 @@ commands.reload = async function() {
 // neo doctor — diagnose setup issues
 commands.doctor = async function(args) {
   const fix = (args || []).includes('--fix');
+  const config = loadNeoConfig();
+  const cdpUrl = getConfiguredCdpUrl();
+  const cdpPort = getConfiguredCdpPort();
   const checks = [];
-  function check(name, fn, fixFn, opts) { checks.push({ name, fn, fixFn, critical: opts && opts.critical }); }
+  function check(name, fn, fixFn, opts) {
+    checks.push({
+      name,
+      fn,
+      fixFn,
+      critical: !!(opts && opts.critical),
+      optional: !!(opts && opts.optional),
+      key: opts && opts.key ? opts.key : name,
+    });
+  }
 
   check('Chrome CDP endpoint', async () => {
-    const resp = await fetch(`${CDP_URL}/json/version`);
+    const resp = await fetch(`${cdpUrl}/json/version`);
     const info = await resp.json();
-    return `${info.Browser} (${CDP_URL})`;
+    return `${info.Browser} (${cdpUrl})`;
   }, async () => {
     process.stderr.write('  → Starting Chrome with neo start...\n');
-    await commands.start([]);
+    try {
+      await commands.start([]);
+    } catch (error) {
+      const runningWithoutCdp = listChromeProcesses().filter((proc) => proc && !proc.remoteDebuggingPort);
+      if (runningWithoutCdp.length) {
+        throw new Error(`${error.message}. Chrome appears to be running without CDP; close it or retry with neo start --force`);
+      }
+      throw error;
+    }
     await new Promise(r => setTimeout(r, 2000));
-    const resp = await fetch(`${CDP_URL}/json/version`);
+    const resp = await fetch(`${cdpUrl}/json/version`);
     const info = await resp.json();
-    return `Fixed: ${info.Browser} (${CDP_URL})`;
+    return `Fixed: ${info.Browser} (${cdpUrl})`;
   }, { critical: true });
 
   check('Browser tabs', async () => {
-    const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+    const tabs = await (await fetch(`${cdpUrl}/json/list`)).json();
     const pages = tabs.filter(t => t.type === 'page');
     return `${pages.length} page(s), ${tabs.length} total targets`;
   }, null, { critical: false });
 
-  check('Neo extension service worker', async () => {
-    const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
-    if (!sw) throw new Error('Not found — install extension or check NEO_EXTENSION_ID');
+  check('Chrome profile', async () => {
+    const configured = describeConfiguredChromeProfile(config);
+    const activeProcess = listChromeProcesses().find((proc) => proc && (proc.remoteDebuggingPort === cdpPort || proc.profileDirectory || proc.userDataDir));
+    const active = activeProcess
+      ? `${activeProcess.profileDirectory || '(unknown profile)'} @ ${activeProcess.userDataDir || '(default user-data-dir)'}`
+      : 'not detected';
+    return `Configured: ${configured}; Active: ${active}`;
+  }, null, { critical: false });
+
+  check('CDP capture daemon', async () => {
+    const state = readCaptureDaemonState(CDP_CAPTURE_STATE_FILE);
+    if (!state) return 'Not running';
+    if (!isProcessAlive(state.pid)) throw new Error(`Stale state file for pid ${state.pid}`);
+    return `Running (pid ${state.pid}, tab ${state.tabId || '(unknown)'})`;
+  }, async () => {
+    const state = readCaptureDaemonState(CDP_CAPTURE_STATE_FILE);
+    if (state && !isProcessAlive(state.pid) && fs.existsSync(CDP_CAPTURE_STATE_FILE)) {
+      fs.unlinkSync(CDP_CAPTURE_STATE_FILE);
+      return 'Removed stale state file';
+    }
+    return 'Not running';
+  }, { critical: false });
+
+  check('Neo extension service worker (optional - CDP capture available without extension)', async () => {
+    const sw = await findExtensionServiceWorker({ cdpUrl });
+    if (!sw) throw new Error('Not found');
     const extensionId = parseExtensionIdFromUrl(sw.url);
     if (!extensionId) return 'OK';
     return `OK (${extensionId.slice(0, 8)}…)`;
-  }, async () => {
-    process.stderr.write('  → Running neo setup to install extension...\n');
-    await commands.setup([]);
-    process.stderr.write('  → Restarting Chrome...\n');
-    await commands.start(['--force']);
-    await new Promise(r => setTimeout(r, 3000));
-    const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
-    if (!sw) throw new Error('Still not found after fix');
-    return 'Fixed: extension installed and loaded';
-  }, { critical: true });
+  }, null, { critical: false, optional: true, key: 'extension' });
 
-  check('IndexedDB captures', async () => {
-    const wsUrl = await findExtensionWs();
+  check('IndexedDB captures (extension)', async () => {
+    const wsUrl = await findExtensionWs({ cdpUrl });
+    if (!wsUrl) return 'Extension not active';
     const count = await cdpEval(wsUrl, dbEval(`
       store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
     `));
     return `${count} captures stored`;
+  }, null, { critical: false });
+
+  check('CDP JSONL captures', async () => {
+    const count = readLocalCaptureJsonl(LOCAL_CAPTURE_FILE).length;
+    return `${count} captures stored in ${LOCAL_CAPTURE_FILE}`;
   });
 
   check('Schema directory', async () => {
@@ -6570,7 +7058,8 @@ commands.doctor = async function(args) {
 
   check('WebSocket bridge port', async () => {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket('ws://127.0.0.1:9234');
+      const WebSocketCtor = getWebSocketCtor();
+      const ws = new WebSocketCtor('ws://127.0.0.1:9234');
       const timer = setTimeout(() => { ws.close(); resolve('Not running (optional)'); }, 2000);
       ws.on('open', () => { clearTimeout(timer); ws.close(); resolve('Running on :9234'); });
       ws.on('error', () => { clearTimeout(timer); resolve('Not running (optional)'); });
@@ -6578,47 +7067,69 @@ commands.doctor = async function(args) {
   });
 
   let fixed = 0;
-  const status = { ready: true, chrome: false, extension: false, captures: null, actions: [] };
-  for (const { name, fn, fixFn, critical } of checks) {
+  const status = {
+    ready: true,
+    chrome: false,
+    extension: false,
+    captures: null,
+    cdpCaptures: 0,
+    profile: {
+      configured: String(config.defaultProfile || '').trim() || null,
+      userDataDir: String(config.userDataDir || '').trim() || null,
+      active: null,
+    },
+    actions: [],
+  };
+  for (const { name, fn, fixFn, critical, optional, key } of checks) {
     try {
       const result = await fn();
       console.log(`  ✓  ${name}: ${result}`);
-      if (name === 'Chrome CDP endpoint') status.chrome = true;
-      if (name === 'Neo extension service worker') status.extension = true;
-      if (name === 'IndexedDB captures') {
+      if (key === 'Chrome CDP endpoint') status.chrome = true;
+      if (key === 'extension') status.extension = true;
+      if (key === 'IndexedDB captures (extension)') {
         const m = String(result).match(/^(\d+)/);
         status.captures = m ? parseInt(m[1], 10) : 0;
       }
+      if (key === 'CDP JSONL captures') {
+        const m = String(result).match(/^(\d+)/);
+        status.cdpCaptures = m ? parseInt(m[1], 10) : 0;
+      }
+      if (key === 'Chrome profile') {
+        const activeMatch = String(result).match(/Active: (.+)$/);
+        status.profile.active = activeMatch ? activeMatch[1] : null;
+      }
     } catch (err) {
+      if (optional) {
+        console.log(`  ○  ${name}: ${err.message}`);
+        continue;
+      }
       if (critical) status.ready = false;
       if (fix && fixFn) {
         try {
           const result = await fixFn();
           console.log(`  ✓  ${name}: ${result}`);
           fixed++;
-          if (name === 'Chrome CDP endpoint') { status.chrome = true; status.ready = !status.actions.some(a => a.includes('extension')); }
-          if (name === 'Neo extension service worker') { status.extension = true; status.ready = status.chrome; }
+          if (key === 'Chrome CDP endpoint') status.chrome = true;
         } catch (fixErr) {
           console.log(`  ✗  ${name}: ${fixErr.message}`);
-          if (name === 'Chrome CDP endpoint') {
+          if (key === 'Chrome CDP endpoint') {
             status.actions.push('Chrome CDP not reachable. Run: neo start');
-          } else if (name === 'Neo extension service worker') {
-            status.actions.push(`Neo extension not found in Chrome. Ask user to install: open chrome://extensions → Developer Mode → Load Unpacked → select ${NEO_HOME_DIR}/extension`);
+          } else if (key === 'CDP capture daemon') {
+            status.actions.push(`Stale CDP capture daemon state. Remove: ${CDP_CAPTURE_STATE_FILE}`);
           }
         }
       } else {
         console.log(`  ✗  ${name}: ${err.message}${fixFn ? ' (use --fix to auto-repair)' : ''}`);
-        if (name === 'Chrome CDP endpoint') {
+        if (key === 'Chrome CDP endpoint') {
           status.actions.push('Chrome CDP not reachable. Run: neo start');
-        } else if (name === 'Neo extension service worker') {
-          status.actions.push(`Neo extension not found in Chrome. Ask user to install: open chrome://extensions → Developer Mode → Load Unpacked → select ${NEO_HOME_DIR}/extension`);
+        } else if (key === 'CDP capture daemon') {
+          status.actions.push(`Stale CDP capture daemon state. Remove: ${CDP_CAPTURE_STATE_FILE}`);
         }
       }
     }
   }
   if (fix && fixed > 0) console.log(`\n  Fixed ${fixed} issue(s).`);
-  // Recompute ready: both chrome and extension must be true
-  status.ready = status.chrome && status.extension;
+  status.ready = status.chrome;
   console.log(`\nNEO_STATUS: ${JSON.stringify(status)}`);
 };
 
@@ -6636,7 +7147,7 @@ async function main() {
 
 Commands:
   neo status                              Overview of captured data
-  neo capture list|count|domains|detail|search|stats|summary|prune|clear|export|import
+  neo capture start|stop|list|count|domains|detail|search|stats|summary|prune|clear|export|import
                                           Manage captured API traffic
   neo schema generate|show|search <domain>  API schema management
   neo exec <url> [options]                Execute fetch in browser context
@@ -6645,7 +7156,9 @@ Commands:
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
   neo setup [--profile <name>]             Setup ~/.neo config, extension, and schemas
-  neo start [--profile <name>]             Start Chrome with configured Neo extension
+  neo start [--profile <name>]             Start Chrome with configured Neo/system profile
+  neo profile list                         List system Chrome/Chromium profiles
+  neo profile use <name>                   Set default system Chrome profile
   neo profiles                             List configured profiles
   neo launch <app> [--port N]             Launch Electron app with CDP enabled
   neo connect [port]                      Connect to CDP and save active session
