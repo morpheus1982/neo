@@ -78,7 +78,7 @@ const NEO_CONFIG_FILE = path.join(NEO_HOME_DIR, 'config.json');
 const NEO_EXTENSION_DIR = path.join(NEO_HOME_DIR, 'extension');
 const DEFAULT_SESSION_NAME = '__default__';
 const EXTENSION_NOT_FOUND_MESSAGE = 'Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222';
-const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map|mp4|mpe?g|avi|mov|webm|pdf|zip|gz|tar)(?:[?#].*)?$/i;
+const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map|mp4|mpe?g|avi|mov|webm|pdf|zip|gz|tar|glb|gltf|obj|fbx|stl|dae|3ds|wasm|bin)(?:[?#].*)?$/i;
 const CDP_CAPTURE_SKIP_PROTOCOLS = new Set(['chrome-extension:', 'devtools:', 'data:', 'blob:', 'about:']);
 const CHROME_PROFILE_ROOTS = Object.freeze([
   { browserName: 'Google Chrome', userDataDir: path.join(process.env.HOME, '.config/google-chrome') },

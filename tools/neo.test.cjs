@@ -1366,7 +1366,7 @@ test('returns null for unsupported key', () => {
 
 // ─── Interceptor utils (extracted pure functions) ───────────────
 
-const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map)(?:[?#].*)?$/i;
+const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map|mp4|mpe?g|avi|mov|webm|pdf|zip|gz|tar|glb|gltf|obj|fbx|stl|dae|3ds|wasm|bin)(?:[?#].*)?$/i;
 const ANALYTICS_KEYWORDS = [
   'google-analytics', 'googletagmanager', 'sentry.io', 'mixpanel.com',
   'hdslb.com', 'bilivideo.com', 'api.honeycomb.io',
