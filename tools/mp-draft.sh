@@ -1,13 +1,39 @@
 #!/bin/bash
 # mp-draft.sh - 微信公众平台草稿自动化脚本
 #
+# 功能:
+#   1. 打开微信公众平台
+#   2. 自动检测登录状态（未登录则等待扫码）
+#   3. 创建一篇测试草稿
+#   4. 捕获 API 请求并生成文档
+#
 # 用法:
-#   ./tools/mp-draft.sh [--title "标题"] [--content "正文"] [--author "作者"] [--skip-schema] [--keep-tab]
+#   ./tools/mp-draft.sh                              # 使用默认测试内容
+#   ./tools/mp-draft.sh --title "标题" --content "正文"
+#   ./tools/mp-draft.sh --skip-schema --keep-tab    # 调试模式
+#
+# 选项:
+#   --title TEXT      草稿标题
+#   --author TEXT     作者名
+#   --content TEXT    草稿正文
+#   --skip-schema     跳过 schema 生成（调试用）
+#   --keep-tab        保持标签页打开（调试用）
+#   -h, --help        显示帮助
 #
 # 依赖:
-#   - neo CLI (npm i -g @4ier/neo)
-#   - Chrome 浏览器 (启用 CDP 端口 9222)
+#   - neo CLI: npm i -g @4ier/neo
+#   - Chrome 浏览器 (启用 CDP: neo start)
 #   - Neo 扩展已安装
+#
+# 示例:
+#   # 基本使用
+#   ./tools/mp-draft.sh
+#
+#   # 自定义内容
+#   ./tools/mp-draft.sh --title "我的文章" --author "张三" --content "这是正文"
+#
+#   # 调试模式（不生成文档，保持标签页）
+#   ./tools/mp-draft.sh --skip-schema --keep-tab
 
 set -e
 
