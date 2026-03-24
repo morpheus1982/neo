@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(neo doctor:*)",
+      "Bash(neo start:*)",
+      "Bash(neo setup:*)",
+      "Bash(neo open:*)",
+      "Bash(neo read:*)",
+      "Bash(neo snapshot:*)",
+      "Bash(neo:*)",
+      "Bash(NEO_EXTENSION_ID=kjjbboioakijoklobdonifdiaamdecel neo doctor:*)",
+      "Bash(node:*)",
+      "Bash(bash -n D:/src/third/neo/tools/mp-draft.sh)",
+      "Bash(D:/src/third/neo/tools/mp-draft.sh --help)",
+      "Bash(bash -n tools/mp-draft.sh)",
+      "Bash(bash tools/mp-draft.sh --help)",
+      "Bash(bash tools/mp-draft.sh)",
+      "Bash(./tools/mp-draft.sh --help)",
+      "Bash(./tools/mp-draft.sh --skip-schema --keep-tab)",
+      "Bash(node tools/neo.cjs eval 'document.querySelector\\(\"\".weui-desktop-menu__name\"\"\\)?.innerText' --tab \"mp.weixin\")",
+      "Bash(node tools/neo.cjs eval 'document.querySelector\\(\"\".weui-desktop-btn__main\"\"\\)?.innerText' --tab \"mp.weixin\")",
+      "Bash(node -e \":*)",
+      "Bash(node -e ':*)",
+      "Bash(node tools/neo.cjs eval 'document.querySelectorAll\\(\"\"iframe\"\"\\).length' --tab \"appmsg_edit\")",
+      "Bash(sed -i \"s/> 生成时间:.*/> 生成时间: 2026-03-24/\" mp-api.md)",
+      "Bash(sed -i \"s/> 总捕获数:.*次/> 总捕获数: 183 次/\" mp-api.md)",
+      "Bash(sed -i \"s/> 唯一接口数:.*个/> 唯一接口数: 40 个/\" mp-api.md)"
+    ]
+  }
+}

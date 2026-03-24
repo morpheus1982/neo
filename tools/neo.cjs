@@ -48,17 +48,18 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn, execSync } = require('child_process');
 
 const CDP_URL = process.env.NEO_CDP_URL || 'http://localhost:9222';
 const DB_NAME = 'neo-capture-v01';
 const STORE_NAME = 'capturedRequests';
 const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || null;
-const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, '.neo/schemas');
+const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(os.homedir(), '.neo/schemas');
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const EXTENSION_ID_CACHE_FILE = '/tmp/neo-ext-id';
-const NEO_BASE_DIR = path.join(process.env.HOME, '.neo');
+const NEO_BASE_DIR = path.join(os.homedir(), '.neo');
 const NEO_PROFILE = process.env.NEO_PROFILE || null;
 function getNeoHomeDir(profile) {
   const p = profile || NEO_PROFILE;
@@ -169,6 +170,19 @@ function detectChromeBinaryPath(deps = {}) {
   if (platform === 'darwin') {
     const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     if (existsSyncFn(macChromePath)) return macChromePath;
+  }
+
+  if (platform === 'win32') {
+    const winChromePaths = [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(process.env.PROGRAMFILES || '', 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google\\Chrome\\Application\\chrome.exe'),
+    ];
+    for (const winPath of winChromePaths) {
+      if (winPath && existsSyncFn(winPath)) return winPath;
+    }
   }
 
   return null;
