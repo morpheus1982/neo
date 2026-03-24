@@ -174,6 +174,68 @@ navigate_to_editor() {
     return 0
 }
 
+# 填写草稿标题
+fill_title() {
+    local title="$1"
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null)
+
+    # 查找标题输入框（第一个 textbox）
+    local title_ref
+    title_ref=$(echo "$snapshot" | grep "textbox" | head -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -n "$title_ref" ]]; then
+        neo fill "$title_ref" "$title" > /dev/null 2>&1
+        log_success "标题: ${title}"
+        return 0
+    else
+        log_error "未找到标题输入框"
+        return 1
+    fi
+}
+
+# 填写作者
+fill_author() {
+    local author="$1"
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null)
+
+    # 查找作者输入框
+    local author_ref
+    author_ref=$(echo "$snapshot" | grep -i "作者" | grep -E "textbox|text" | head -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -n "$author_ref" ]]; then
+        neo fill "$author_ref" "$author" > /dev/null 2>&1
+        log_success "作者: ${author}"
+        return 0
+    fi
+    # 作者字段可选
+    log_info "未找到作者输入框（可选字段）"
+    return 0
+}
+
+# 填写正文
+fill_content() {
+    local content="$1"
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null)
+
+    # 查找正文编辑区域
+    local content_ref
+    content_ref=$(echo "$snapshot" | grep "textbox" | tail -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -n "$content_ref" ]]; then
+        neo click "$content_ref" > /dev/null 2>&1
+        sleep 1
+        neo fill "$content_ref" "$content" > /dev/null 2>&1
+        log_success "正文已填写"
+        return 0
+    else
+        log_error "未找到正文编辑区域"
+        return 1
+    fi
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -248,7 +310,11 @@ main() {
 
     # Step 5: 填写草稿内容
     log_step 5 ${total_steps} "填写草稿内容"
-    echo "TODO: 实现"
+    sleep 2  # 等待编辑器完全加载
+
+    fill_title "$TITLE"
+    fill_author "$AUTHOR"
+    fill_content "$CONTENT"
 
     # Step 6: 保存草稿
     log_step 6 ${total_steps} "保存草稿"
