@@ -139,6 +139,41 @@ wait_for_login() {
     return 1
 }
 
+# 导航到草稿编辑页
+navigate_to_editor() {
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null)
+
+    # Step 4a: 点击"草稿箱"菜单
+    local draft_ref
+    draft_ref=$(echo "$snapshot" | grep "草稿箱" | head -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -z "$draft_ref" ]]; then
+        log_error "未找到草稿箱菜单"
+        return 1
+    fi
+
+    neo click "$draft_ref" > /dev/null 2>&1
+    sleep 2
+    log_success "已进入草稿箱"
+
+    # Step 4b: 点击"新的创作"按钮
+    snapshot=$(neo snapshot 2>/dev/null)
+    local new_ref
+    new_ref=$(echo "$snapshot" | grep -E "新的创作|写新图文" | head -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -z "$new_ref" ]]; then
+        log_error "未找到新建草稿按钮"
+        return 1
+    fi
+
+    neo click "$new_ref" > /dev/null 2>&1
+    sleep 3
+    log_success "编辑器已加载"
+
+    return 0
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -205,7 +240,11 @@ main() {
 
     # Step 4: 进入草稿编辑页
     log_step 4 ${total_steps} "进入草稿编辑页"
-    echo "TODO: 实现"
+    if ! navigate_to_editor; then
+        log_error "无法进入草稿编辑页"
+        log_info "请手动检查页面状态"
+        exit 1
+    fi
 
     # Step 5: 填写草稿内容
     log_step 5 ${total_steps} "填写草稿内容"
