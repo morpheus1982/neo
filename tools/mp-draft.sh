@@ -121,7 +121,32 @@ main() {
 
     # Step 1: 环境检查
     log_step 1 ${total_steps} "环境检查"
-    echo "TODO: 实现"
+
+    # 检查 neo 命令
+    if ! command -v neo &> /dev/null; then
+        log_error "neo CLI 未安装"
+        log_info "请运行: npm i -g @4ier/neo"
+        exit 1
+    fi
+    log_success "neo CLI 已安装"
+
+    # 检查 CDP 连接（通过 neo doctor）
+    log_info "检查 CDP 连接..."
+    if ! neo doctor 2>&1 | grep -qi "cdp\|connected\|ok"; then
+        log_error "CDP 连接失败"
+        log_info "请确保 Chrome 已启动: neo start"
+        exit 1
+    fi
+    log_success "CDP 连接正常"
+
+    # 检查 Neo 扩展状态
+    log_info "检查 Neo 扩展..."
+    if ! neo doctor 2>&1 | grep -qi "extension\|扩展"; then
+        log_error "Neo 扩展未安装或未激活"
+        log_info "请检查 chrome://extensions"
+        exit 1
+    fi
+    log_success "Neo 扩展正常"
 
     # Step 2: 打开页面
     log_step 2 ${total_steps} "打开微信公众平台"
