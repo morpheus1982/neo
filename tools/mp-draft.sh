@@ -104,6 +104,41 @@ log_info() {
     echo "  $1"
 }
 
+# 检查是否已登录微信公众平台
+check_mp_login() {
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null || echo "{}")
+
+    # 检查是否存在"草稿箱"菜单（已登录标志）
+    if echo "$snapshot" | grep -q "草稿箱"; then
+        return 0
+    fi
+    return 1
+}
+
+# 等待用户扫码登录
+wait_for_login() {
+    local waited=0
+    echo ""
+    log_info "请在浏览器中扫码登录..."
+    log_info "最长等待 ${MAX_LOGIN_WAIT} 秒"
+
+    while [[ $waited -lt $MAX_LOGIN_WAIT ]]; do
+        sleep $LOGIN_CHECK_INTERVAL
+        waited=$((waited + LOGIN_CHECK_INTERVAL))
+
+        if check_mp_login; then
+            echo ""
+            return 0
+        fi
+
+        echo -n "."
+    done
+
+    echo ""
+    return 1
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -150,11 +185,23 @@ main() {
 
     # Step 2: 打开页面
     log_step 2 ${total_steps} "打开微信公众平台"
-    echo "TODO: 实现"
+    neo open "$MP_URL" > /dev/null 2>&1
+    sleep 3  # 等待页面加载
+    log_success "已打开 ${MP_URL}"
 
     # Step 3: 检测登录状态
     log_step 3 ${total_steps} "检测登录状态"
-    echo "TODO: 实现"
+    if check_mp_login; then
+        log_success "已登录"
+    else
+        log_info "未登录，等待扫码..."
+        if wait_for_login; then
+            log_success "登录成功"
+        else
+            log_error "登录超时"
+            exit 1
+        fi
+    fi
 
     # Step 4: 进入草稿编辑页
     log_step 4 ${total_steps} "进入草稿编辑页"
