@@ -261,6 +261,46 @@ save_draft() {
     fi
 }
 
+# 生成 API 文档
+generate_api_doc() {
+    local domain="mp.weixin.qq.com"
+    local schema_file="$HOME/.neo/schemas/${domain}.json"
+    local doc_file="$(cd "$(dirname "$0")/.." && pwd)/mp-api.md"
+
+    log_info "生成 schema..."
+    if ! neo schema generate "$domain" 2>/dev/null; then
+        log_error "Schema 生成失败"
+        return 1
+    fi
+    log_success "Schema 已生成"
+
+    # 获取统计信息
+    local capture_count
+    capture_count=$(neo capture count "$domain" 2>/dev/null | grep -oP '\d+' | head -1 || echo "?")
+
+    local endpoint_count
+    endpoint_count=$(cat "$schema_file" 2>/dev/null | grep -oP '"uniqueEndpoints":\s*\K\d+' || echo "?")
+
+    # 更新 mp-api.md
+    if [[ -f "$doc_file" ]]; then
+        local today=$(date +%Y-%m-%d)
+        if [[ "$(uname)" == "Darwin" ]]; then
+            sed -i '' "s/> 生成时间:.*/> 生成时间: ${today}/" "$doc_file"
+            sed -i '' "s/> 总捕获数:.*/> 总捕获数: ${capture_count} 次/" "$doc_file"
+            sed -i '' "s/> 唯一接口数:.*/> 唯一接口数: ${endpoint_count} 个/" "$doc_file"
+        else
+            sed -i "s/> 生成时间:.*/> 生成时间: ${today}/" "$doc_file"
+            sed -i "s/> 总捕获数:.*/> 总捕获数: ${capture_count} 次/" "$doc_file"
+            sed -i "s/> 唯一接口数:.*/> 唯一接口数: ${endpoint_count} 个/" "$doc_file"
+        fi
+        log_success "API 文档已更新"
+    else
+        log_info "mp-api.md 不存在，跳过更新"
+    fi
+
+    return 0
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -350,7 +390,14 @@ main() {
 
     # Step 7: 生成 API 文档
     log_step 7 ${total_steps} "生成 API 文档"
-    echo "TODO: 实现"
+    if [[ "$SKIP_SCHEMA" == "true" ]]; then
+        log_info "已跳过 (--skip-schema)"
+    else
+        if ! generate_api_doc; then
+            log_error "文档生成失败"
+            # 不退出，继续清理
+        fi
+    fi
 
     # Step 8: 清理
     log_step 8 ${total_steps} "清理"
