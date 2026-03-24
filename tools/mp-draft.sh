@@ -236,6 +236,31 @@ fill_content() {
     fi
 }
 
+# 保存草稿
+save_draft() {
+    local snapshot
+    snapshot=$(neo snapshot 2>/dev/null)
+
+    # 查找"保存"按钮
+    local save_ref
+    save_ref=$(echo "$snapshot" | grep -i "保存" | grep -i "button" | head -1 | grep -oP '@\d+' | head -1)
+
+    if [[ -z "$save_ref" ]]; then
+        # 备选：查找任意包含"保存"的可点击元素
+        save_ref=$(echo "$snapshot" | grep "保存" | head -1 | grep -oP '@\d+' | head -1)
+    fi
+
+    if [[ -n "$save_ref" ]]; then
+        neo click "$save_ref" > /dev/null 2>&1
+        sleep 3
+        log_success "草稿已保存"
+        return 0
+    else
+        log_error "未找到保存按钮"
+        return 1
+    fi
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -318,7 +343,10 @@ main() {
 
     # Step 6: 保存草稿
     log_step 6 ${total_steps} "保存草稿"
-    echo "TODO: 实现"
+    if ! save_draft; then
+        log_error "保存失败"
+        exit 1
+    fi
 
     # Step 7: 生成 API 文档
     log_step 7 ${total_steps} "生成 API 文档"
