@@ -301,6 +301,44 @@ generate_api_doc() {
     return 0
 }
 
+# 清理：关闭标签页
+cleanup() {
+    if [[ "$KEEP_TAB" == "true" ]]; then
+        log_info "保持标签页打开 (--keep-tab)"
+        return 0
+    fi
+
+    log_info "关闭标签页..."
+    neo eval "window.close()" --tab "mp.weixin.qq.com" > /dev/null 2>&1 || true
+    log_success "标签页已关闭"
+}
+
+# 输出完成摘要
+print_summary() {
+    local domain="mp.weixin.qq.com"
+
+    # 获取统计信息
+    local capture_count
+    capture_count=$(neo capture count "$domain" 2>/dev/null | grep -oP '\d+' | head -1 || echo "?")
+
+    local endpoint_count
+    endpoint_count=$(cat "$HOME/.neo/schemas/${domain}.json" 2>/dev/null | grep -oP '"uniqueEndpoints":\s*\K\d+' || echo "?")
+
+    echo ""
+    echo "============================================"
+    echo "  ✅ 完成！"
+    echo "============================================"
+    echo ""
+    echo "摘要:"
+    log_info "草稿标题: ${TITLE}"
+    log_info "捕获总数: ${capture_count}"
+    log_info "接口数量: ${endpoint_count}"
+    echo ""
+    log_info "查看捕获: neo capture list ${domain}"
+    log_info "查看 Schema: neo schema show ${domain}"
+    log_info "API 文档: mp-api.md"
+}
+
 # ============================================
 # 主流程
 # ============================================
@@ -401,12 +439,9 @@ main() {
 
     # Step 8: 清理
     log_step 8 ${total_steps} "清理"
-    echo "TODO: 实现"
+    cleanup
 
-    echo ""
-    echo "============================================"
-    echo "  ✅ 完成！"
-    echo "============================================"
+    print_summary
 }
 
 main "$@"
