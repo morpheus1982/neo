@@ -1,0 +1,277 @@
+# Neo API Debugger Skill Design
+
+## Overview
+
+**Skill Name:** `neo-api-debugger`
+
+**Core Purpose:** Enable AI programming assistants to automatically discover hidden APIs on any website and generate multi-language callable API documentation (Go, Python, JavaScript, etc.), allowing AI to perform browser-like operations through direct API calls.
+
+**Target Users:** Developers using AI coding assistants who need to interact with websites that lack official APIs.
+
+---
+
+## Problem Statement
+
+AI agents interacting with web apps today have two bad options:
+
+| Approach | Pain Point |
+|----------|------------|
+| Official APIs | Most SaaS doesn't have one, or only exposes 10% of features |
+| Browser automation | Screenshot → OCR → click. Slow, fragile, breaks on every UI change |
+
+**Neo is the third way.** Every web app already has a complete internal API — the frontend calls it every time you click something. This skill enables AI to capture, analyze, and generate production-ready API code from those calls.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Neo API Debugger Skill                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐              │
+│  │ Discover │ →  │ Capture  │ →  │ Analyze  │              │
+│  └──────────┘    └──────────┘    └──────────┘              │
+│       ↓              ↓               ↓                       │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐              │
+│  │  Open    │    │ Monitor  │    │ Schema   │              │
+│  │  Website │    │  Traffic │    │ Generate │              │
+│  └──────────┘    └──────────┘    └──────────┘              │
+│                        ↓                                    │
+│                   ┌──────────┐                              │
+│                   │ Export   │                              │
+│                   │ Docs+Code│                              │
+│                   └──────────┘                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Workflow
+
+### Phase 1: Initialization
+
+1. Run `neo doctor` to verify Chrome + Neo extension are functional
+2. If check fails, provide specific remediation steps
+3. Confirm ready state before proceeding
+
+### Phase 2: Discovery Session
+
+1. User provides target website URL (e.g., `https://x.com`)
+2. AI opens website with `neo open <url>`
+3. User performs typical operations (login, browse, post, etc.)
+4. Neo passively captures all API traffic (fetch/XHR/WebSocket)
+5. AI monitors with `neo capture watch <domain>` in real-time
+
+### Phase 3: Analysis
+
+1. List captured calls: `neo capture list <domain> --limit N`
+2. View capture details: `neo capture detail <capture-id>`
+3. Search specific patterns: `neo capture search "CreateTweet" --method POST`
+4. Generate schema: `neo schema generate <domain>`
+
+### Phase 4: Documentation Export
+
+1. Generate OpenAPI spec: `neo schema openapi <domain>`
+2. Export to file: `neo capture export <domain> --format har > api.har`
+3. AI processes captured data and generates multi-language code examples
+
+---
+
+## Command Interface
+
+### Primary Commands
+
+```bash
+# Start a new API discovery session
+neo-api-discover <url> [--name "project-name"] [--languages go,python,js,ts]
+
+# Watch real-time API traffic
+neo-api-watch <domain>
+
+# Generate API documentation from captures
+neo-api-document <domain> [--format openapi|markdown|json]
+
+# Export specific endpoint as code
+neo-api-export <domain> <endpoint-id> [--lang python|go|js|ts|curl]
+
+# List all discovered APIs for a domain
+neo-api-list <domain>
+
+# Test an API call directly
+neo-api-test <domain> <endpoint-id> [--body '{}']
+```
+
+### Internal Neo Commands Used
+
+| Command | Purpose |
+|---------|---------|
+| `neo doctor` | Verify setup |
+| `neo open <url>` | Open website in Chrome |
+| `neo capture watch <domain>` | Real-time traffic monitoring |
+| `neo capture list <domain>` | List captured API calls |
+| `neo capture detail <id>` | Show full request/response |
+| `neo capture search <query>` | Search captures |
+| `neo schema generate <domain>` | Generate API schema |
+| `neo schema show <domain>` | Display schema |
+| `neo schema openapi <domain>` | Export OpenAPI 3.0 spec |
+| `neo exec <url>` | Execute API call |
+| `neo replay <id>` | Replay captured call |
+
+---
+
+## Output Format
+
+### Generated Documentation Structure
+
+```markdown
+# {Website} API Documentation
+*Auto-generated by Neo API Debugger Skill*
+
+## Overview
+- **Domain:** {domain}
+- **Discovered:** {timestamp}
+- **Endpoints:** {count}
+- **Auth Type:** {cookie|bearer|etc}
+
+## Authentication
+
+All API calls automatically inherit browser authentication via CDP.
+For programmatic access, extract cookies with:
+```
+
+### Endpoint Documentation
+
+```markdown
+### {METHOD} {path}
+
+**Description:** {What this endpoint does}
+**Trigger:** {UI action that triggers this call}
+**Auth:** {Authentication type}
+
+**Request Headers:**
+| Header | Value |
+|--------|-------|
+| Content-Type | application/json |
+| X-CSRF-Token | auto-injected |
+
+**Request Body:**
+```json
+{
+  "variables": {
+    "tweet_text": "Hello world"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "data": {
+    "create_tweet": {
+      "tweet_results": {
+        "result": { ... }
+      }
+    }
+  }
+}
+```
+
+### Multi-Language Code Examples
+
+```python
+# Python - requests
+import requests
+
+url = "https://api.example.com/endpoint"
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer <token>"
+}
+data = {...}
+
+response = requests.post(url, json=data, headers=headers)
+print(response.json())
+```
+
+```javascript
+// JavaScript - fetch
+const response = await fetch('https://api.example.com/endpoint', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer <token>'
+  },
+  body: JSON.stringify({...})
+});
+const data = await response.json();
+```
+
+```go
+// Go - net/http
+req, _ := http.NewRequest("POST", "https://api.example.com/endpoint", bytes.NewBuffer(data))
+req.Header.Set("Content-Type", "application/json")
+req.Header.Set("Authorization", "Bearer <token>")
+client := &http.Client{}
+resp, _ := client.Do(req)
+defer resp.Body.Close()
+```
+
+---
+
+## User Interaction Flow
+
+```
+User: "帮我发现 x.com 的 API，然后生成 Python 代码"
+
+AI:
+  1. neo doctor
+  2. neo open https://x.com
+  3. "请在浏览器中登录并发布一条推文"
+  4. neo capture watch x.com
+  5. neo capture list x.com
+  6. neo schema generate x.com
+  7. [Generate Python code examples from captures]
+  8. [Present documentation to user]
+```
+
+---
+
+## Key Features
+
+1. **Passive Capture** — No code injection required, works with any website
+2. **Auto-Auth** — Inherits cookies/session from Chrome automatically
+3. **Multi-Language Output** — Generates code for Python, Go, JavaScript, TypeScript, cURL
+4. **OpenAPI Export** — Standard format for Postman, Insomnia, Swagger
+5. **Real-time Monitoring** — Watch API calls as they happen
+6. **Endpoint Search** — Find specific APIs by keyword or HTTP method
+7. **Schema Versioning** — Track API changes over time
+
+---
+
+## Skill Metadata
+
+```yaml
+name: neo-api-debugger
+description: >
+  Discover hidden APIs on any website and generate multi-language callable API documentation.
+  Use when: user wants to call a website's API that has no official API,
+  automate web interactions via API instead of browser automation,
+  generate API documentation from real traffic.
+triggers:
+  - discover API
+  - find hidden API
+  - generate API code
+  - website API documentation
+  - call website API
+```
+
+---
+
+## Implementation Notes
+
+- Authentication headers are redacted at capture time for security
+- `neo exec --auto-headers` fetches live auth from browser at execution time
+- Response bodies truncated at 100KB to prevent storage bloat
+- Per-domain cap of 500 captures with automatic oldest-first cleanup
