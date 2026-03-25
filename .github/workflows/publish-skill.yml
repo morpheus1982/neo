@@ -1,0 +1,34 @@
+name: Publish Skill
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'skill/**'
+
+jobs:
+  clawhub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm i -g clawhub
+      - name: Configure ClawHub auth
+        run: |
+          mkdir -p ~/.config/clawhub
+          echo '{"registry":"https://clawhub.com","token":"${{ secrets.CLAWHUB_TOKEN }}"}' > ~/.config/clawhub/config.json
+      - name: Publish to ClawHub
+        run: |
+          # Use package.json version + patch suffix from commit count
+          BASE_VERSION=$(node -p "require('./package.json').version")
+          COMMIT_COUNT=$(git rev-list --count HEAD -- skill/)
+          VERSION="${BASE_VERSION}-skill.${COMMIT_COUNT}"
+          clawhub publish ./skill \
+            --slug neo-browser \
+            --name "Neo — Web App API Discovery" \
+            --version "$VERSION" \
+            --changelog "Skill docs update ($(git log -1 --format='%s' -- skill/))"
