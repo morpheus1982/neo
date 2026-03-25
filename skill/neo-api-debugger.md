@@ -281,7 +281,7 @@ print(response.json())
 
 ## Decision Tree
 
-```
+```text
 Want to discover and use a website's API?
   │
   ├─ FIRST: neo doctor
